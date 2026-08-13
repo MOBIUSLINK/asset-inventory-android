@@ -2,7 +2,6 @@ package cn.assetinventory.app
 
 import android.Manifest
 import android.app.Application
-import android.bluetooth.BluetoothAdapter
 import android.bluetooth.BluetoothDevice
 import android.bluetooth.BluetoothManager
 import android.content.Context
@@ -15,14 +14,21 @@ import android.os.Handler
 import android.os.Looper
 import androidx.activity.compose.rememberLauncherForActivityResult
 import androidx.activity.result.contract.ActivityResultContracts
+import androidx.compose.foundation.Image
+import androidx.compose.foundation.background
 import androidx.compose.foundation.clickable
 import androidx.compose.foundation.layout.*
 import androidx.compose.foundation.lazy.LazyColumn
 import androidx.compose.foundation.lazy.items
+import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.material3.*
+import androidx.compose.material.icons.Icons
+import androidx.compose.material.icons.rounded.CheckCircle
+import androidx.compose.material.icons.rounded.Info
 import androidx.compose.runtime.*
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
+import androidx.compose.ui.graphics.asImageBitmap
 import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.unit.dp
 import androidx.core.content.ContextCompat
@@ -61,8 +67,7 @@ object NiimbotB3sPrinter {
     fun pairedDevices(context:Context):List<NiimbotDevice>{
         val adapter=context.getSystemService(BluetoothManager::class.java).adapter?:return emptyList()
         if(ContextCompat.checkSelfPermission(context,Manifest.permission.BLUETOOTH_CONNECT)!=PackageManager.PERMISSION_GRANTED)return emptyList()
-        return adapter.bondedDevices.filter{it.type==BluetoothDevice.DEVICE_TYPE_CLASSIC||it.type==BluetoothDevice.DEVICE_TYPE_DUAL}
-            .map{NiimbotDevice(it.name?:"蓝牙设备",it.address)}.sortedBy{if(it.name.contains("B3S",true))0 else 1}
+        return adapter.bondedDevices.filter{it.type==BluetoothDevice.DEVICE_TYPE_CLASSIC||it.type==BluetoothDevice.DEVICE_TYPE_DUAL}.map{NiimbotDevice(it.name?:"蓝牙设备",it.address)}.sortedBy{if(it.name.contains("B3S",true))0 else 1}
     }
 
     fun connect(context:Context,address:String,done:(Result<Unit>)->Unit)=executor.execute{
@@ -76,15 +81,8 @@ object NiimbotB3sPrinter {
         val bitmaps=labels.map(::labelBitmap);var submittedPages=0
         p.setTotalPrintQuantity(bitmaps.size)
         p.startPrintJob(3,1,1,object:PrintCallback{
-            override fun onBufferFree(pageIndex:Int,bufferSize:Int){
-                // 严格按 SDK 缓存回调逐页提交，禁止一次塞入全部页面，否则 B3S_P 会在页面间误走空白标签。
-                if(submittedPages<bitmaps.size){val bitmap=bitmaps[submittedPages++];p.commitImageData(0,bitmap,WIDTH_MM,HEIGHT_MM,1,0,0,0,0,"")}
-            }
-            override fun onProgress(pageIndex:Int,quantityIndex:Int,data:HashMap<String,Any>){
-                done("正在打印 ${pageIndex.coerceIn(1,bitmaps.size)}/${bitmaps.size}")
-                // SDK 页码和份数从 1 开始；只在最后一页真正完成后结束，避免额外走纸定位。
-                if(pageIndex==bitmaps.size&&quantityIndex==1){p.endPrintJob();done("打印完成：${bitmaps.size} 张")}
-            }
+            override fun onBufferFree(pageIndex:Int,bufferSize:Int){if(submittedPages<bitmaps.size){val bitmap=bitmaps[submittedPages++];p.commitImageData(0,bitmap,WIDTH_MM,HEIGHT_MM,1,0,0,0,0,"")}}
+            override fun onProgress(pageIndex:Int,quantityIndex:Int,data:HashMap<String,Any>){done("正在打印 ${pageIndex.coerceIn(1,bitmaps.size)}/${bitmaps.size}");if(pageIndex==bitmaps.size&&quantityIndex==1){p.endPrintJob();done("打印完成：${bitmaps.size} 张")}}
             override fun onError(code:Int){done(errorText(code))}
             override fun onError(code:Int,state:Int){done(errorText(code))}
             override fun onPause(success:Boolean){}
@@ -94,25 +92,22 @@ object NiimbotB3sPrinter {
         })
     }
 
+    fun preview(label:QrLabel)=labelBitmap(label)
+
     private fun labelBitmap(label:QrLabel):Bitmap{
         val width=(WIDTH_MM*MULTIPLE).toInt();val height=(HEIGHT_MM*MULTIPLE).toInt()
         val bitmap=Bitmap.createBitmap(width,height,Bitmap.Config.ARGB_8888);val canvas=Canvas(bitmap);canvas.drawColor(Color.WHITE)
-        // 二维码占满 15 mm 标签高度，仅在左右方向保留 0.5 mm 定位余量。
         val horizontalInset=(0.6f*MULTIPLE).toInt();val qrSize=height+4
-        val qr=QrGenerator.bitmapForPayload(label.payload,qrSize,0)
-        // 放大约 0.5 mm，并向下移动 0.25 mm；上下轻微溢出由标签边界自然裁切。
-        val qrTop=-1f;canvas.drawBitmap(qr,horizontalInset.toFloat(),qrTop,null)
-        // 左侧外边距与二维码到编号之间的间距一致，形成视觉对称。
+        val qr=QrGenerator.bitmapForPayload(label.payload,qrSize,0);canvas.drawBitmap(qr,horizontalInset.toFloat(),-1f,null)
         val visualGap=horizontalInset;val textLeft=horizontalInset+qrSize+visualGap;val textRight=width-horizontalInset;val textWidth=(textRight-textLeft).toFloat()
         val displayText=if(label.type=="区域")label.name.ifBlank{label.code}else label.code
         val paint=Paint(Paint.ANTI_ALIAS_FLAG).apply{color=Color.BLACK;textAlign=Paint.Align.CENTER;typeface=android.graphics.Typeface.create(android.graphics.Typeface.DEFAULT,android.graphics.Typeface.BOLD);isFakeBoldText=true;textSize=42f}
         while(paint.measureText(displayText)>textWidth&&paint.textSize>20f)paint.textSize-=1f
-        val metrics=paint.fontMetrics;val baseline=height/2f-(metrics.ascent+metrics.descent)/2f
-        canvas.drawText(displayText,(textLeft+textRight)/2f,baseline,paint)
+        val metrics=paint.fontMetrics;val baseline=height/2f-(metrics.ascent+metrics.descent)/2f;canvas.drawText(displayText,(textLeft+textRight)/2f,baseline,paint)
         return bitmap
     }
 
-    private fun errorText(code:Int)=when(code){1->"打印机上盖未关闭";2->"标签纸用完";3->"电量不足";23->"打印机连接已断开";24->"标签尺寸参数错误";27->"B3S_P 出纸异常";28->"请检查标签纸类型";else->"打印失败（错误码 $code）"}
+    private fun errorText(code:Int)=when(code){1->"打印机上盖未关闭";2->"标签纸用完";3->"打印机电量不足";23->"打印机连接已断开";24->"标签尺寸参数错误";27->"B3S_P 出纸异常";28->"请检查标签纸类型";else->"打印失败（错误码 $code）"}
 }
 
 @Composable
@@ -121,22 +116,13 @@ fun NiimbotPrintDialog(labels:List<QrLabel>,onDismiss:()->Unit){
     fun refresh(){devices=NiimbotB3sPrinter.pairedDevices(context);selected=devices.firstOrNull{it.name.contains("B3S",true)}?:devices.firstOrNull();message=if(devices.isEmpty())"未找到已配对设备，请先到系统蓝牙配对 B3S_P" else "请选择 B3S_P 并连接"}
     val permission=rememberLauncherForActivityResult(ActivityResultContracts.RequestMultiplePermissions()){refresh()}
     LaunchedEffect(Unit){if(android.os.Build.VERSION.SDK_INT>=31)permission.launch(arrayOf(Manifest.permission.BLUETOOTH_CONNECT,Manifest.permission.BLUETOOTH_SCAN))else refresh()}
-    AlertDialog(
-        onDismissRequest=onDismiss,
-        title={Text("NIIMBOT B3S_P · T40×15")},
-        text={Column{
-            Text("资产标签右侧显示编号，区域标签右侧显示区域名称；二维码始终使用编号标识。共 ${labels.size} 张。",style=MaterialTheme.typography.bodySmall)
-            Spacer(Modifier.height(8.dp));Text(message);Spacer(Modifier.height(8.dp))
-            LazyColumn(Modifier.heightIn(max=180.dp)){items(devices){d->
-                Row(Modifier.fillMaxWidth().clickable{selected=d}.padding(vertical=8.dp),verticalAlignment=Alignment.CenterVertically){
-                    RadioButton(selected==d,{selected=d});Column{Text(d.name);Text(d.address,style=MaterialTheme.typography.bodySmall)}
-                }
-            }}
-            TextButton(onClick={refresh()}){Text("刷新已配对设备")}
-            Button(onClick={selected?.let{d->busy=true;message="正在连接 ${d.name}…";NiimbotB3sPrinter.connect(context,d.address){r->busy=false;connected=r.isSuccess;message=if(r.isSuccess)"B3S_P 已连接，可以打印" else r.exceptionOrNull()?.message?:"连接失败"}}},enabled=selected!=null&&!busy,modifier=Modifier.fillMaxWidth()){Text(if(busy)"正在连接…" else "连接打印机")}
-            Spacer(Modifier.height(8.dp))
-            Button(onClick={busy=true;NiimbotB3sPrinter.print(context,labels){message=it;busy=!it.startsWith("打印完成")&&!it.startsWith("打印失败")}},enabled=connected&&!busy,modifier=Modifier.fillMaxWidth()){Text("打印 ${labels.size} 张")}
-        }},
-        confirmButton={TextButton(onClick=onDismiss){Text("关闭")}}
-    )
+    val preview=remember(labels){NiimbotB3sPrinter.preview(labels.first())}
+    AlertDialog(onDismissRequest={if(!busy)onDismiss()},title={Text("NIIMBOT B3S_P · T40×15")},text={Column{
+        Text("打印预览（首张）",style=MaterialTheme.typography.labelLarge);Image(preview.asImageBitmap(),"首张标签预览",Modifier.fillMaxWidth().aspectRatio(40f/15f).background(androidx.compose.ui.graphics.Color.White).padding(4.dp));Text("共 ${labels.size} 张 · ${labels.first().code} 至 ${labels.last().code}",style=MaterialTheme.typography.bodySmall)
+        Spacer(Modifier.height(10.dp));Surface(shape=RoundedCornerShape(10.dp),color=MaterialTheme.colorScheme.surfaceVariant){Row(Modifier.fillMaxWidth().padding(10.dp),verticalAlignment=Alignment.CenterVertically){if(busy)CircularProgressIndicator(Modifier.size(20.dp),strokeWidth=2.dp) else Icon(if(connected)Icons.Rounded.CheckCircle else Icons.Rounded.Info,null,Modifier.size(20.dp));Spacer(Modifier.width(8.dp));Text(message,Modifier.weight(1f),style=MaterialTheme.typography.bodySmall)}}
+        LazyColumn(Modifier.heightIn(max=150.dp)){items(devices){d->Row(Modifier.fillMaxWidth().clickable(enabled=!busy){selected=d}.padding(vertical=6.dp),verticalAlignment=Alignment.CenterVertically){RadioButton(selected==d,{selected=d},enabled=!busy);Column{Text(d.name);Text(d.address,style=MaterialTheme.typography.bodySmall)}}}}
+        TextButton(onClick={refresh()},enabled=!busy){Text("刷新已配对设备")}
+        Button(onClick={selected?.let{d->busy=true;message="正在连接 ${d.name}…";NiimbotB3sPrinter.connect(context,d.address){r->busy=false;connected=r.isSuccess;message=if(r.isSuccess)"B3S_P 已连接，可以打印" else r.exceptionOrNull()?.message?:"连接失败"}}},enabled=selected!=null&&!busy,modifier=Modifier.fillMaxWidth()){Text(if(busy&&!connected)"正在连接…" else "连接打印机")}
+        Spacer(Modifier.height(8.dp));Button(onClick={busy=true;NiimbotB3sPrinter.print(context,labels){message=it;busy=it.startsWith("正在打印")}},enabled=connected&&!busy,modifier=Modifier.fillMaxWidth()){Text("开始打印 ${labels.size} 张")}
+    }},confirmButton={TextButton(onClick=onDismiss,enabled=!busy){Text("关闭")}})
 }

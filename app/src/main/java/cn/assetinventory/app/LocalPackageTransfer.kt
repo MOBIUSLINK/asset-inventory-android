@@ -1,7 +1,6 @@
 package cn.assetinventory.app
 
 import android.content.Context
-import android.net.Uri
 import android.net.ConnectivityManager
 import android.net.NetworkCapabilities
 import android.net.wifi.SupplicantState
@@ -47,22 +46,12 @@ fun localIpv4Address(context:Context):Inet4Address? {
         val wifi=caps.hasTransport(NetworkCapabilities.TRANSPORT_WIFI)
         val networkWifiInfo=caps.transportInfo as? WifiInfo
         val legacyWifiInfo=runCatching{wifiManager.connectionInfo}.getOrNull()
-        // Some phones retain the old Wi-Fi LinkProperties/IP after disconnecting.
-        // Supplicant state changes immediately, so never publish that stale address.
-        // networkId is deliberately hidden as -1 on some recent Android builds,
-        // so it cannot be used as a connection test.
         val wifiReallyConnected=wifi&&wifiManager.isWifiEnabled&&(
-            networkWifiInfo?.supplicantState==SupplicantState.COMPLETED||
-                legacyWifiInfo?.supplicantState==SupplicantState.COMPLETED
-            )
-        if(ethernet||wifiReallyConnected){
-            cm.getLinkProperties(network)?.linkAddresses?.map{it.address}?.filterIsInstance<Inet4Address>()?.firstOrNull{!it.isLoopbackAddress&&it.isSiteLocalAddress}?.let{return it}
-        }
+            networkWifiInfo?.supplicantState==SupplicantState.COMPLETED||legacyWifiInfo?.supplicantState==SupplicantState.COMPLETED)
+        if(ethernet||wifiReallyConnected){cm.getLinkProperties(network)?.linkAddresses?.map{it.address}?.filterIsInstance<Inet4Address>()?.firstOrNull{!it.isLoopbackAddress&&it.isSiteLocalAddress}?.let{return it}}
     }
-    // A phone acting as a hotspot may not expose a ConnectivityManager network.
     val hotspotInterface=Regex("^(ap|softap)[0-9A-Za-z_.-]*$",RegexOption.IGNORE_CASE)
-    return NetworkInterface.getNetworkInterfaces().toList().filter{it.isUp&&hotspotInterface.matches(it.name)}
-        .flatMap{it.inetAddresses.toList()}.filterIsInstance<Inet4Address>().firstOrNull{!it.isLoopbackAddress&&it.isSiteLocalAddress}
+    return NetworkInterface.getNetworkInterfaces().toList().filter{it.isUp&&hotspotInterface.matches(it.name)}.flatMap{it.inetAddresses.toList()}.filterIsInstance<Inet4Address>().firstOrNull{!it.isLoopbackAddress&&it.isSiteLocalAddress}
 }
 
 object LocalPackageReceiver{
