@@ -1,0 +1,23 @@
+# Android Studio and local machine settings
+.idea/
+*.iml
+local.properties
+
+# Gradle/Kotlin generated files
+.gradle/
+.kotlin/
+**/build/
+
+# Local temporary and output files
+tmp/
+captures/
+*.log
+
+# Signing credentials must never be committed
+*.jks
+*.keystore
+keystore.properties
+
+# OS files
+.DS_Store
+Thumbs.db

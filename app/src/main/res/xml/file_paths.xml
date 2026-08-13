@@ -1,0 +1,9 @@
+<?xml version="1.0" encoding="utf-8"?>
+<paths xmlns:android="http://schemas.android.com/apk/res/android">
+    <files-path name="anomaly_photos" path="anomaly_photos/" />
+    <files-path name="task_packages" path="task_packages/" />
+    <files-path name="generated_qr" path="generated_qr/" />
+    <files-path name="qr_exports" path="qr_exports/" />
+    <files-path name="backups" path="task_packages/" />
+    <cache-path name="nearby_transfer" path="nearby_transfer/" />
+</paths>
