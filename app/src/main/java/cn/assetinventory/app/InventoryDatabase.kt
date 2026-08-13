@@ -4,6 +4,7 @@ import android.content.ContentValues
 import android.content.Context
 import android.database.sqlite.SQLiteDatabase
 import android.database.sqlite.SQLiteOpenHelper
+import java.io.File
 import java.util.UUID
 
 data class Company(val id: String, val code: String, val name: String)
@@ -40,7 +41,7 @@ data class TransferScan(
 )
 
 class InventoryDatabase(context: Context) :
-    SQLiteOpenHelper(context, "asset_inventory.db", null, 11) {
+    SQLiteOpenHelper(context, "asset_inventory.db", null, 12) {
 
     override fun onConfigure(db: SQLiteDatabase) {
         super.onConfigure(db)
@@ -51,6 +52,7 @@ class InventoryDatabase(context: Context) :
         createMasterTables(db)
         createLedgerTables(db)
         createScanTable(db)
+        createDeletionAudit(db)
     }
 
     override fun onUpgrade(db: SQLiteDatabase, oldVersion: Int, newVersion: Int) {
@@ -69,6 +71,14 @@ class InventoryDatabase(context: Context) :
         if(oldVersion<9)migrateLedgerToCompanies(db)
         if(oldVersion<10)createDeliveryTracking(db)
         if(oldVersion<11)createCompanyHistory(db)
+        if(oldVersion<12)createDeletionAudit(db)
+    }
+
+    private fun createDeletionAudit(db: SQLiteDatabase) {
+        db.execSQL("""CREATE TABLE IF NOT EXISTS deletion_audit(
+            id TEXT PRIMARY KEY, entity_type TEXT NOT NULL, entity_id TEXT NOT NULL,
+            entity_code TEXT NOT NULL, entity_name TEXT NOT NULL, operator_name TEXT NOT NULL,
+            reason TEXT NOT NULL, impact_summary TEXT NOT NULL, deleted_at INTEGER NOT NULL)""")
     }
 
     private fun migrateLedgerToCompanies(db: SQLiteDatabase) {
@@ -323,7 +333,8 @@ class InventoryDatabase(context: Context) :
     fun allAreas():List<Area> = readableDatabase.rawQuery("SELECT id,company_id,code,name FROM area WHERE enabled=1 ORDER BY name",null).use{c->buildList{while(c.moveToNext())add(Area(c.getString(0),c.getString(1),c.getString(2),c.getString(3)))}}
 
     fun createTask(companyId: String, name: String): InventoryTask {
-        val task = InventoryTask(UUID.randomUUID().toString(), companyId, name.trim(), "进行中")
+        val finalName=name.trim().ifBlank{suggestedTaskName(companyId)}
+        val task = InventoryTask(UUID.randomUUID().toString(), companyId, finalName, "进行中")
         writableDatabase.beginTransaction()
         try {
             writableDatabase.insertOrThrow("inventory_task", null, ContentValues().apply {
@@ -341,6 +352,17 @@ class InventoryDatabase(context: Context) :
         return task
     }
 
+    fun suggestedTaskName(companyId:String):String{
+        val companyName=company(companyId).name
+        val date=java.text.SimpleDateFormat("yyyy-MM-dd",java.util.Locale.CHINA).format(java.util.Date())
+        val base="$companyName $date 盘点"
+        val existing=readableDatabase.rawQuery("SELECT name FROM inventory_task WHERE company_id=? AND (name=? OR name LIKE ?)",arrayOf(companyId,base,"$base-%")).use{cursor->buildSet{while(cursor.moveToNext())add(cursor.getString(0))}}
+        if(base !in existing)return base
+        var sequence=2
+        while("$base-$sequence" in existing)sequence++
+        return "$base-$sequence"
+    }
+
     fun tasks(): List<InventoryTask> = readableDatabase.rawQuery(
         "SELECT id,company_id,name,status FROM inventory_task ORDER BY created_at DESC", null
     ).use { c -> buildList { while (c.moveToNext()) add(InventoryTask(c.getString(0), c.getString(1), c.getString(2), c.getString(3))) } }
@@ -353,6 +375,43 @@ class InventoryDatabase(context: Context) :
     fun completeTask(taskId:String){require(taskCompletionCheck(taskId).canComplete){"仍有待处理事项"};writableDatabase.update("inventory_task",ContentValues().apply{put("status","已完成")},"id=? AND status='进行中'",arrayOf(taskId))}
     fun reopenTask(taskId:String,operator:String,reason:String){require(operator.isNotBlank()&&reason.isNotBlank());writableDatabase.beginTransaction();try{writableDatabase.update("inventory_task",ContentValues().apply{put("status","进行中")},"id=? AND status IN ('已完成','已归档')",arrayOf(taskId));writableDatabase.insert("work_session",null,ContentValues().apply{put("id",UUID.randomUUID().toString());put("task_id",taskId);put("operator_name",operator.trim());put("started_at",System.currentTimeMillis());put("ended_at",System.currentTimeMillis());put("handover_note","重新开启：${reason.trim()}")});writableDatabase.setTransactionSuccessful()}finally{writableDatabase.endTransaction()}}
     fun archiveTask(taskId:String){writableDatabase.update("inventory_task",ContentValues().apply{put("status","已归档")},"id=? AND status='已完成'",arrayOf(taskId))}
+
+    fun deleteTask(taskId: String, operator: String, reason: String) {
+        val who=operator.trim();val why=reason.trim();require(who.isNotBlank()){ "请填写操作人" };require(why.isNotBlank()){ "请填写删除原因" }
+        val target=task(taskId);val photos=readableDatabase.rawQuery("SELECT p.path FROM anomaly_photo p JOIN scan_event s ON s.id=p.scan_id WHERE s.task_id=?",arrayOf(taskId)).use{c->buildList{while(c.moveToNext())add(c.getString(0))}}
+        val scans=readableDatabase.rawQuery("SELECT COUNT(*) FROM scan_event WHERE task_id=?",arrayOf(taskId)).use{it.moveToFirst();it.getInt(0)}
+        val db=writableDatabase;db.beginTransaction()
+        try{
+            db.delete("anomaly_photo","scan_id IN (SELECT id FROM scan_event WHERE task_id=?)",arrayOf(taskId))
+            db.delete("scan_event","task_id=?",arrayOf(taskId));db.delete("work_session","task_id=?",arrayOf(taskId));db.delete("task_area","task_id=?",arrayOf(taskId));db.delete("inventory_task","id=?",arrayOf(taskId))
+            db.insertOrThrow("deletion_audit",null,ContentValues().apply{put("id",UUID.randomUUID().toString());put("entity_type","TASK");put("entity_id",target.id);put("entity_code",target.id);put("entity_name",target.name);put("operator_name",who);put("reason",why);put("impact_summary","扫码记录 $scans 条，照片 ${photos.size} 张");put("deleted_at",System.currentTimeMillis())})
+            db.setTransactionSuccessful()
+        }finally{db.endTransaction()}
+        photos.forEach{runCatching{File(it).delete()}}
+    }
+
+    fun deleteCompany(companyId: String, operator: String, reason: String) {
+        val who=operator.trim();val why=reason.trim();require(who.isNotBlank()){ "请填写操作人" };require(why.isNotBlank()){ "请填写删除原因" }
+        val target=company(companyId)
+        val taskCount=readableDatabase.rawQuery("SELECT COUNT(*) FROM inventory_task WHERE company_id=?",arrayOf(companyId)).use{it.moveToFirst();it.getInt(0)}
+        val assetCount=ledgerAssetCount(companyId);val areaCount=areas(companyId).size
+        val photos=readableDatabase.rawQuery("SELECT p.path FROM anomaly_photo p JOIN scan_event s ON s.id=p.scan_id JOIN inventory_task t ON t.id=s.task_id WHERE t.company_id=?",arrayOf(companyId)).use{c->buildList{while(c.moveToNext())add(c.getString(0))}}
+        val db=writableDatabase;db.beginTransaction()
+        try{
+            db.delete("anomaly_photo","scan_id IN (SELECT s.id FROM scan_event s JOIN inventory_task t ON t.id=s.task_id WHERE t.company_id=?)",arrayOf(companyId))
+            db.delete("scan_event","task_id IN (SELECT id FROM inventory_task WHERE company_id=?)",arrayOf(companyId))
+            db.delete("work_session","task_id IN (SELECT id FROM inventory_task WHERE company_id=?)",arrayOf(companyId))
+            db.delete("task_area","task_id IN (SELECT id FROM inventory_task WHERE company_id=?)",arrayOf(companyId))
+            db.delete("inventory_task","company_id=?",arrayOf(companyId))
+            db.delete("ledger_issue","import_id IN (SELECT id FROM ledger_import WHERE company_id=?)",arrayOf(companyId))
+            db.delete("asset_ledger","company_id=?",arrayOf(companyId));db.delete("ledger_import","company_id=?",arrayOf(companyId))
+            db.delete("company_change_audit","company_id=?",arrayOf(companyId));db.delete("company_code_history","company_id=?",arrayOf(companyId))
+            db.delete("area","company_id=?",arrayOf(companyId));db.delete("company","id=?",arrayOf(companyId))
+            db.insertOrThrow("deletion_audit",null,ContentValues().apply{put("id",UUID.randomUUID().toString());put("entity_type","COMPANY");put("entity_id",target.id);put("entity_code",target.code);put("entity_name",target.name);put("operator_name",who);put("reason",why);put("impact_summary","台账 $assetCount 项，区域 $areaCount 个，任务 $taskCount 个，照片 ${photos.size} 张");put("deleted_at",System.currentTimeMillis())})
+            db.setTransactionSuccessful()
+        }finally{db.endTransaction()}
+        photos.forEach{runCatching{File(it).delete()}}
+    }
 
     fun company(id: String): Company = readableDatabase.rawQuery("SELECT id,code,name FROM company WHERE id=?", arrayOf(id)).use { c ->
         require(c.moveToFirst()); Company(c.getString(0), c.getString(1), c.getString(2))

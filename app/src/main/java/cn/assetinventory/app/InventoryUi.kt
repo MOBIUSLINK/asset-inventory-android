@@ -5,6 +5,7 @@ import android.content.Context
 import android.content.Intent
 import android.content.pm.PackageManager
 import android.net.Uri
+import android.provider.Settings
 import android.os.VibrationEffect
 import android.os.Vibrator
 import android.widget.Toast
@@ -76,6 +77,8 @@ private val LocalOpenDrawer=staticCompositionLocalOf<()->Unit>{{}}
 private val LocalCurrentCompany=staticCompositionLocalOf<Company?>{null}
 private val LocalCompanies=staticCompositionLocalOf<List<Company>>{emptyList()}
 private val LocalSwitchCompany=staticCompositionLocalOf<(Company)->Unit>{{}}
+private val LocalAddCompany=staticCompositionLocalOf<()->Unit>{{}}
+private val LocalManageCompany=staticCompositionLocalOf<(Company)->Unit>{{}}
 
 private sealed interface Screen {
     data object Home : Screen
@@ -88,7 +91,6 @@ private sealed interface Screen {
     data class BatchQr(val company: Company) : Screen
     data object Backup : Screen
     data object NearbyReceive : Screen
-    data object AssetCenter : Screen
     data object TaskPreparation : Screen
     data class EditCompany(val company: Company) : Screen
     data class Areas(val company: Company) : Screen
@@ -132,7 +134,7 @@ fun InventoryRoot(database: InventoryDatabase, voiceStatus: String, speak: (Stri
     val selectedCompany=companies.firstOrNull{it.id==preferredCompanyId}?:companies.firstOrNull()
     val activeTasks = tasks.filter { it.status == "进行中" && (selectedCompany==null||it.companyId==selectedCompany.id) }
     val preferredTaskId = prefs.getString("current_task_id", null)
-    val selectedTask = activeTasks.firstOrNull { it.id == preferredTaskId } ?: activeTasks.firstOrNull() ?: tasks.firstOrNull{it.companyId==selectedCompany?.id}
+    val selectedTask = activeTasks.firstOrNull { it.id == preferredTaskId } ?: activeTasks.firstOrNull()
     val drawerState=rememberDrawerState(DrawerValue.Closed);val scope=rememberCoroutineScope()
 
     BackHandler(enabled = screen == Screen.Home || screen == Screen.SettingsHome) {
@@ -150,8 +152,9 @@ fun InventoryRoot(database: InventoryDatabase, voiceStatus: String, speak: (Stri
         }
     }
 
-    CompositionLocalProvider(LocalOpenDrawer provides {scope.launch{drawerState.open()}},LocalCurrentCompany provides selectedCompany,LocalCompanies provides companies,LocalSwitchCompany provides {company->prefs.edit().putString("current_company_id",company.id).remove("current_task_id").apply();refresh++;navigateRoot(Screen.Home)}) {
-    ModalNavigationDrawer(drawerState=drawerState,gesturesEnabled=screen==Screen.Home||screen==Screen.SettingsHome,drawerContent={ModalDrawerSheet{AppDrawer(operator,selectedCompany,onOperator={prefs.edit().putString("operator",it).apply();refresh++},onClose={scope.launch{drawerState.close()}},onAsset={scope.launch{drawerState.close()};navigate(Screen.AssetCenter)},onTasks={scope.launch{drawerState.close()};navigate(Screen.TaskPreparation)},onNearby={scope.launch{drawerState.close()};navigate(Screen.NearbyReceive)},onImportTask={scope.launch{drawerState.close()};navigate(Screen.ImportTask)},onImportResult={scope.launch{drawerState.close()};navigate(Screen.ImportResult)},onBackup={scope.launch{drawerState.close()};navigate(Screen.Backup)})}}){
+    fun notify(message:String)=Toast.makeText(context,message,Toast.LENGTH_SHORT).show()
+    CompositionLocalProvider(LocalOpenDrawer provides {scope.launch{drawerState.open()}},LocalCurrentCompany provides selectedCompany,LocalCompanies provides companies,LocalSwitchCompany provides {company->prefs.edit().putString("current_company_id",company.id).remove("current_task_id").apply();refresh++;navigateRoot(Screen.Home);notify("已切换到 ${company.name}")},LocalAddCompany provides {navigate(Screen.CompanySetup)},LocalManageCompany provides {navigate(Screen.EditCompany(it))}) {
+    ModalNavigationDrawer(drawerState=drawerState,gesturesEnabled=screen==Screen.Home||screen==Screen.SettingsHome,drawerContent={ModalDrawerSheet{AppDrawer(operator,selectedCompany,onOperator={prefs.edit().putString("operator",it).apply();refresh++},onClose={scope.launch{drawerState.close()}},onAsset={scope.launch{drawerState.close()};selectedCompany?.let{navigate(Screen.Ledger(it))}?:navigate(Screen.CompanySetup)},onTasks={scope.launch{drawerState.close()};navigate(Screen.TaskPreparation)},onNearby={scope.launch{drawerState.close()};navigate(Screen.NearbyReceive)},onBackup={scope.launch{drawerState.close()};navigate(Screen.Backup)})}}){
     when (val current=screen) {
         Screen.Home -> HomeScreen(
             database = database,
@@ -175,8 +178,7 @@ fun InventoryRoot(database: InventoryDatabase, voiceStatus: String, speak: (Stri
             onSelectTask = { prefs.edit().putString("current_task_id",it.id).apply(); refresh++ },
             onOperator = { prefs.edit().putString("operator", it).apply(); refresh++ }
         )
-        Screen.AssetCenter -> AssetCenterScreen(selectedCompany,database,{goBack()},{navigate(Screen.Ledger(it))},{navigate(Screen.ImportLedger(it))},{navigate(Screen.BatchQr(it))})
-        Screen.TaskPreparation -> TaskPreparationScreen(selectedCompany,tasks,database,{goBack()},{navigate(Screen.Areas(it))},{navigate(Screen.NewTask(it))},{navigate(Screen.TaskDetail(it))},{navigate(Screen.EditCompany(it))},{navigate(Screen.CompanySetup)})
+        Screen.TaskPreparation -> TaskPreparationScreen(selectedCompany,tasks,{goBack()},{navigate(Screen.Areas(it))},{navigate(Screen.NewTask(it))},{navigate(Screen.TaskDetail(it))})
         is Screen.EditCompany -> CompanyEditScreen(
             company=remember(refresh){database.company(current.company.id)},
             ledgerCount=remember(refresh){database.ledgerAssetCount(current.company.id)},
@@ -184,56 +186,50 @@ fun InventoryRoot(database: InventoryDatabase, voiceStatus: String, speak: (Stri
             taskCount=remember(refresh){database.tasks().count{it.companyId==current.company.id}},
             defaultOperator=operator,
             onBack={goBack()},
-            onSave={code,name,who,reason->database.updateCompany(current.company.id,code,name,who,reason);prefs.edit().putString("operator",who.trim()).apply();refresh++;goBack()}
+            onSave={code,name,who,reason->runCatching{database.updateCompany(current.company.id,code,name,who,reason)}.onSuccess{prefs.edit().putString("operator",who.trim()).apply();refresh++;goBack();notify("公司资料已保存")}.onFailure{notify("保存失败：${it.message}")}},
+            onDelete={who,reason->runCatching{val backup=InventoryBackup.create(context,database);database.deleteCompany(current.company.id,who,reason);backup.name}.onSuccess{prefs.edit().remove("current_company_id").remove("current_task_id").putString("operator",who.trim()).apply();refresh++;navigateRoot(Screen.Home);notify("公司已删除，保护性备份：$it")}.onFailure{notify("删除失败：${it.message}")}}
         )
         Screen.SettingsHome -> SettingsHomeScreen(
             company = selectedCompany,
-            tasks = selectedTask?.let { listOf(it) }.orEmpty(),
-            ledgerCounts = companies.associate { it.id to database.ledgerAssetCount(it.id) },
+            tasks = tasks.filter{it.companyId==selectedCompany?.id},
             onScan = { navigateRoot(Screen.Home) },
-            onSetup = { navigate(Screen.CompanySetup) },
-            onAreas = { navigate(Screen.Areas(it)) },
             onNewTask = { navigate(Screen.NewTask(it)) },
             onTask = { navigate(Screen.TaskDetail(it)) },
             onExportTask = { navigate(Screen.ExportTask(it)) },
             onExportResult = { navigate(Screen.ExportResult(it)) },
-            onLedger = { navigate(Screen.Ledger(it)) },
-            onImportLedger = { navigate(Screen.ImportLedger(it)) },
             onImportTask = { navigate(Screen.ImportTask) },
             onImportResult = { navigate(Screen.ImportResult) },
-            onDeliveryStatus={navigate(Screen.DeliveryStatus(it))},
-            onBatchQr = { navigate(Screen.BatchQr(it)) },
-            onBackup = { navigate(Screen.Backup) }
+            onDeliveryStatus={navigate(Screen.DeliveryStatus(it))}
         )
         Screen.CompanySetup -> CompanySetupScreen(
             onBack = { goBack() },
             onSave = { code, name ->
                 runCatching { database.createCompany(code, name) }.onSuccess {
-                    refresh++; navigate(Screen.Areas(it))
-                }
+                    prefs.edit().putString("current_company_id",it.id).apply();refresh++;navigate(Screen.Areas(it));notify("公司已创建，请添加盘点区域")
+                }.onFailure{notify("创建公司失败：${it.message}")}
             }
         )
-        is Screen.ImportLedger -> ImportLedgerScreen(database, current.company, operator,
-            onBack = { refresh++; goBack() })
-        is Screen.Ledger -> LedgerScreen(database, current.company, onBack = { goBack() })
-        Screen.ImportTask -> ImportTaskPackageScreen(database, onBack={refresh++;goBack()})
-        Screen.ImportResult -> ImportResultPackageScreen(database,onBack={refresh++;goBack()})
+        is Screen.ImportLedger -> ImportLedgerScreen(database,current.company,operator,onBack={refresh++;goBack()},onDone={refresh++;navigateRoot(Screen.Ledger(current.company));notify("台账已导入，可以查询或打印标签")})
+        is Screen.Ledger -> LedgerScreen(database,current.company,onBack={goBack()},onImport={navigate(Screen.ImportLedger(current.company))},onBatchPrint={navigate(Screen.BatchQr(current.company))})
+        Screen.ImportTask -> ImportTaskPackageScreen(database,onBack={refresh++;goBack()},onDone={refresh++;navigateRoot(Screen.Home);notify("任务已导入，可以开始盘点")})
+        Screen.ImportResult -> ImportResultPackageScreen(database,onBack={refresh++;goBack()},onDone={refresh++;goBack();notify("盘点结果已合并")})
         is Screen.BatchQr -> BatchQrScreen(database,current.company,onBack={goBack()})
         Screen.Backup -> BackupScreen(database,onBack={refresh++;goBack()})
-        Screen.NearbyReceive -> NearbyReceiveScreen(database,onBack={refresh++;goBack()})
+        Screen.NearbyReceive -> NearbyReceiveScreen(database,onBack={refresh++;goBack()},onDone={refresh++;navigateRoot(Screen.Home)})
         is Screen.Areas -> AreasScreen(
             company = current.company,
             areas = remember(refresh) { database.areas(current.company.id) },
             onBack = { refresh++; goBack() },
-            onAdd = { code, name -> database.addArea(current.company.id, code, name); refresh++ },
-            onUpdate = { area, code, name -> database.updateArea(area.id, code, name); refresh++ }
+            onAdd = { code, name -> database.addArea(current.company.id, code, name); refresh++;notify("区域已添加") },
+            onUpdate = { area, code, name -> database.updateArea(area.id, code, name); refresh++;notify("区域资料已保存") },
+            onDone={navigate(Screen.NewTask(current.company))}
         )
-        is Screen.NewTask -> NewTaskScreen(current.company, database.areas(current.company.id),
+        is Screen.NewTask -> NewTaskScreen(current.company,database.areas(current.company.id),database.ledgerAssetCount(current.company.id),remember(refresh){database.suggestedTaskName(current.company.id)},
             onBack = { goBack() },
             onSave = { name ->
                 runCatching { database.createTask(current.company.id, name) }.onSuccess {
-                    refresh++; navigate(Screen.TaskDetail(it))
-                }
+                    prefs.edit().putString("current_task_id",it.id).apply();refresh++;navigateRoot(Screen.Home);notify("盘点任务已创建，请扫描区域二维码开始盘点")
+                }.onFailure{notify("创建任务失败：${it.message}")}
             })
         is Screen.TaskDetail -> TaskDetailScreen(
             task = remember(refresh){database.task(current.task.id)},
@@ -241,16 +237,12 @@ fun InventoryRoot(database: InventoryDatabase, voiceStatus: String, speak: (Stri
             count = remember(refresh) { database.taskValidCount(current.task.id) },
             operator = operator,
             onBack = { refresh++; goBack() },
-            onStart = { name ->
-                prefs.edit().putString("operator", name).apply()
-                val sessionId = database.startSession(current.task.id, name)
-                navigate(Screen.Scanner(current.task, name, sessionId))
-            },
             onRecords = { navigate(Screen.ScanRecords(current.task)) },
             duplicateCount = remember(refresh) { database.crossRegionDuplicateCodes(current.task.id).size },
             onDuplicates = { navigate(Screen.Duplicates(current.task)) }
-            , onSummary = { navigate(Screen.Summary(current.task)) }, onExport = { navigate(Screen.ExportTask(current.task)) }, onExportResult={navigate(Screen.ExportResult(current.task))},onExportExcel={navigate(Screen.ExportExcel(current.task))},
-            completionCheck=remember(refresh){database.taskCompletionCheck(current.task.id)},onComplete={database.completeTask(current.task.id);refresh++},onArchive={database.archiveTask(current.task.id);refresh++},onReopen={op,reason->database.reopenTask(current.task.id,op,reason);refresh++}
+            , onSummary = { navigate(Screen.Summary(current.task)) },onExportExcel={navigate(Screen.ExportExcel(current.task))},
+            completionCheck=remember(refresh){database.taskCompletionCheck(current.task.id)},onComplete={database.completeTask(current.task.id);prefs.edit().remove("current_task_id").apply();refresh++;notify("盘点任务已完成，可导出 Excel")},onArchive={database.archiveTask(current.task.id);prefs.edit().remove("current_task_id").apply();refresh++;notify("任务已归档，仍可查看和导出")},onReopen={op,reason->database.reopenTask(current.task.id,op,reason);prefs.edit().putString("current_task_id",current.task.id).apply();refresh++;notify("任务已重新开启")},
+            onDelete={who,reason->runCatching{val backup=InventoryBackup.create(context,database);database.deleteTask(current.task.id,who,reason);backup.name}.onSuccess{prefs.edit().remove("current_task_id").putString("operator",who.trim()).apply();refresh++;navigateRoot(Screen.Home);notify("任务已删除，保护性备份：$it")}.onFailure{notify("删除失败：${it.message}")}}
         )
         is Screen.ScanRecords -> ScanRecordsScreen(database, current.task, operator, current.filter) {
             refresh++; goBack()
@@ -298,37 +290,36 @@ private enum class MainDestination { Scan, Settings }
 
 @Composable
 private fun MainPage(title: String, current: MainDestination, onScan: () -> Unit,
-                     onSettings: () -> Unit, content: @Composable ColumnScope.() -> Unit) {
+                     onSettings: () -> Unit,showBottomBar:Boolean=true,centerContent:Boolean=false,content: @Composable ColumnScope.() -> Unit) {
     val openDrawer=LocalOpenDrawer.current;val company=LocalCurrentCompany.current;val companies=LocalCompanies.current;val switchCompany=LocalSwitchCompany.current
-    var chooseCompany by remember{mutableStateOf(false)}
+    val addCompany=LocalAddCompany.current;val manageCompany=LocalManageCompany.current;var chooseCompany by remember{mutableStateOf(false)}
     Scaffold(
         topBar = { Surface(color = MaterialTheme.colorScheme.primary) {
             Row(Modifier.fillMaxWidth().statusBarsPadding().height(58.dp).padding(horizontal = 6.dp),
                 verticalAlignment = Alignment.CenterVertically) {
                 IconButton(onClick=openDrawer){Icon(Icons.Rounded.Menu,"打开侧边栏",tint=Color.White)}
-                Column(Modifier.weight(1f).clickable(enabled=companies.size>1){chooseCompany=true}){Text(company?.name?:title,color=Color.White,style=MaterialTheme.typography.titleMedium);Text(if(companies.size>1)"点击切换公司 ▼" else title,color=Color.White.copy(alpha=.78f),style=MaterialTheme.typography.labelSmall)}
+                Box(Modifier.weight(1f)){Column(Modifier.fillMaxWidth().clickable{chooseCompany=true}){Text(company?.name?:"选择公司",color=Color.White,style=MaterialTheme.typography.titleMedium);Text(if(company==null)"点击创建或选择公司 ▼" else "点击切换公司 ▼",color=Color.White.copy(alpha=.78f),style=MaterialTheme.typography.labelSmall)}
+                    DropdownMenu(expanded=chooseCompany,onDismissRequest={chooseCompany=false},modifier=Modifier.widthIn(min=230.dp)){companies.forEach{c->DropdownMenuItem(text={Column{Text(c.name);Text(c.code,style=MaterialTheme.typography.bodySmall)}},leadingIcon={if(c.id==company?.id)Icon(Icons.Rounded.Check,null)},onClick={chooseCompany=false;if(c.id!=company?.id)switchCompany(c)})};if(companies.isNotEmpty()){HorizontalDivider();company?.let{current->DropdownMenuItem(text={Text("管理当前公司")},leadingIcon={Icon(Icons.Rounded.Business,null)},onClick={chooseCompany=false;manageCompany(current)})}};DropdownMenuItem(text={Text("添加公司")},leadingIcon={Icon(Icons.Rounded.AddBusiness,null)},onClick={chooseCompany=false;addCompany()})}}
             }
         } },
-        bottomBar={NavigationBar{NavigationBarItem(current==MainDestination.Scan,{onScan()},icon={Icon(Icons.Rounded.QrCodeScanner,"盘点")},label={Text("盘点")});NavigationBarItem(current==MainDestination.Settings,{onSettings()},icon={Icon(Icons.Rounded.Send,"交付")},label={Text("交付")})}}
+        bottomBar={if(showBottomBar)NavigationBar{NavigationBarItem(current==MainDestination.Scan,{onScan()},icon={Icon(Icons.Rounded.QrCodeScanner,"盘点")},label={Text("盘点")});NavigationBarItem(current==MainDestination.Settings,{onSettings()},icon={Icon(Icons.Rounded.Send,"交付")},label={Text("交付")})}}
     ) { padding ->
-        Column(Modifier.fillMaxSize().padding(padding).verticalScroll(rememberScrollState()).padding(18.dp), content = content)
+        if(centerContent)Box(Modifier.fillMaxSize().padding(padding).padding(24.dp),contentAlignment=Alignment.Center){Column(Modifier.fillMaxWidth(),horizontalAlignment=Alignment.CenterHorizontally,content=content)}
+        else Column(Modifier.fillMaxSize().padding(padding).verticalScroll(rememberScrollState()).padding(18.dp), content = content)
     }
-    if(chooseCompany)AlertDialog(onDismissRequest={chooseCompany=false},title={Text("切换公司")},text={LazyColumn(Modifier.heightIn(max=520.dp)){items(companies,key={it.id}){c->ListItem(headlineContent={Text(c.name)},supportingContent={Text(c.code)},modifier=Modifier.clickable{switchCompany(c);chooseCompany=false});HorizontalDivider()}}},confirmButton={TextButton(onClick={chooseCompany=false}){Text("取消")}})
 }
 
 @Composable
-private fun AppDrawer(operator:String,company:Company?,onOperator:(String)->Unit,onClose:()->Unit,onAsset:()->Unit,onTasks:()->Unit,onNearby:()->Unit,onImportTask:()->Unit,onImportResult:()->Unit,onBackup:()->Unit){
+private fun AppDrawer(operator:String,company:Company?,onOperator:(String)->Unit,onClose:()->Unit,onAsset:()->Unit,onTasks:()->Unit,onNearby:()->Unit,onBackup:()->Unit){
     var editOperator by remember{mutableStateOf(false)};var name by remember(operator){mutableStateOf(operator)}
     Column(Modifier.fillMaxHeight().width(310.dp).padding(vertical=18.dp)){
         Row(Modifier.fillMaxWidth().clickable{editOperator=true}.padding(20.dp),verticalAlignment=Alignment.CenterVertically){Surface(shape=RoundedCornerShape(40.dp),color=MaterialTheme.colorScheme.primaryContainer,modifier=Modifier.size(54.dp)){Box(contentAlignment=Alignment.Center){Text(operator.takeLast(2).ifBlank{"未设"},style=MaterialTheme.typography.titleMedium)}};Column(Modifier.padding(start=14.dp)){Text(operator.ifBlank{"填写盘点人员"},style=MaterialTheme.typography.titleMedium);Text(company?.name?:"尚未创建公司",style=MaterialTheme.typography.bodySmall)}}
         HorizontalDivider();Text("工作资料",Modifier.padding(20.dp,16.dp,20.dp,6.dp),style=MaterialTheme.typography.labelLarge)
-        NavigationDrawerItem(label={Text("资产台账与标签")},icon={Icon(Icons.Rounded.Inventory2,null)},selected=false,onClick=onAsset,modifier=Modifier.padding(horizontal=12.dp))
-        NavigationDrawerItem(label={Text("任务与公司")},icon={Icon(Icons.Rounded.Business,null)},selected=false,onClick=onTasks,modifier=Modifier.padding(horizontal=12.dp))
+        NavigationDrawerItem(label={Text("资产台账")},icon={Icon(Icons.Rounded.Inventory2,null)},selected=false,onClick=onAsset,modifier=Modifier.padding(horizontal=12.dp))
+        NavigationDrawerItem(label={Text("任务管理")},icon={Icon(Icons.Rounded.Business,null)},selected=false,onClick=onTasks,modifier=Modifier.padding(horizontal=12.dp))
         Text("数据交换",Modifier.padding(20.dp,16.dp,20.dp,6.dp),style=MaterialTheme.typography.labelLarge)
-        NavigationDrawerItem(label={Text("面对面扫码接收")},icon={Icon(Icons.Rounded.WifiTethering,null)},selected=false,onClick=onNearby,modifier=Modifier.padding(horizontal=12.dp))
-        NavigationDrawerItem(label={Text("导入任务包")},icon={Icon(Icons.Rounded.FileDownload,null)},selected=false,onClick=onImportTask,modifier=Modifier.padding(horizontal=12.dp))
-        NavigationDrawerItem(label={Text("合并结果包")},icon={Icon(Icons.Rounded.MergeType,null)},selected=false,onClick=onImportResult,modifier=Modifier.padding(horizontal=12.dp))
-        Spacer(Modifier.weight(1f));HorizontalDivider();NavigationDrawerItem(label={Text("完整备份与恢复")},icon={Icon(Icons.Rounded.Backup,null)},selected=false,onClick=onBackup,modifier=Modifier.padding(horizontal=12.dp))
+        NavigationDrawerItem(label={Text("面对面接收")},icon={Icon(Icons.Rounded.WifiTethering,null)},selected=false,onClick=onNearby,modifier=Modifier.padding(horizontal=12.dp))
+        Spacer(Modifier.weight(1f));HorizontalDivider();NavigationDrawerItem(label={Text("备份与恢复")},icon={Icon(Icons.Rounded.Backup,null)},selected=false,onClick=onBackup,modifier=Modifier.padding(horizontal=12.dp))
         Text("版本 ${BuildConfig.VERSION_NAME} · 构建 ${BuildConfig.VERSION_CODE}",style=MaterialTheme.typography.labelSmall,color=MaterialTheme.colorScheme.onSurfaceVariant,modifier=Modifier.fillMaxWidth().padding(horizontal=24.dp,vertical=14.dp))
     }
     if(editOperator)AlertDialog(onDismissRequest={editOperator=false},title={Text("当前盘点人员")},text={OutlinedTextField(name,{name=it},label={Text("姓名或工号")},singleLine=true)},confirmButton={Button(onClick={onOperator(name.trim());editOperator=false;onClose()},enabled=name.isNotBlank()){Text("确认")}},dismissButton={TextButton(onClick={editOperator=false}){Text("取消")}})
@@ -348,14 +339,25 @@ private fun HomeScreen(database: InventoryDatabase, companies: List<Company>, ta
     var name by remember { mutableStateOf(operator) }
     val activeTask = selectedTask?.takeIf { it.status == "进行中" }
     val currentCompanyId=LocalCurrentCompany.current?.id
+    val currentCompany=companies.firstOrNull{it.id==currentCompanyId}
     val companyTasks=tasks.filter{it.companyId==currentCompanyId}
     val activeCompanyTasks=companyTasks.filter{it.status=="进行中"}
-    val recentTask = activeTask ?: companyTasks.firstOrNull()
+    val recentTask = activeTask
     var chooseTask by remember { mutableStateOf(false) }
     val summary = recentTask?.let { remember(it.id) { database.taskSummary(it.id) } }
     val scannedCount = summary?.let { it.scannedLedger + it.newAssets } ?: 0
     val pendingCount = recentTask?.let { remember(it.id) { database.crossRegionDuplicateCodes(it.id).size } }?.plus(summary?.anomalies ?: 0)?.plus(summary?.newAssets ?: 0) ?: 0
-    MainPage("盘点工作台", MainDestination.Scan, {}, onSettings) {
+    if(activeTask==null){
+        MainPage("资产盘点",MainDestination.Scan,{},onSettings,showBottomBar=false,centerContent=true){
+            Icon(Icons.Rounded.FactCheck,null,tint=MaterialTheme.colorScheme.primary,modifier=Modifier.size(82.dp))
+            Spacer(Modifier.height(22.dp))
+            Text(if(currentCompany==null)"开始第一次资产盘点" else "开始一次新盘点",style=MaterialTheme.typography.headlineSmall)
+            Text(if(currentCompany==null)"先设置公司和区域，之后即可扫描盘点" else "创建任务后即可扫描区域和资产二维码",style=MaterialTheme.typography.bodyMedium,color=MaterialTheme.colorScheme.onSurfaceVariant,modifier=Modifier.padding(top=8.dp,bottom=24.dp))
+            Button(onClick={if(currentCompany==null)onSetup() else onNewTask(currentCompany)},modifier=Modifier.fillMaxWidth()){Icon(if(currentCompany==null)Icons.Rounded.Business else Icons.Rounded.AddTask,null);Spacer(Modifier.width(8.dp));Text(if(currentCompany==null)"设置公司并开始盘点" else "开始一次新盘点")}
+            OutlinedButton(onClick=onImportTask,modifier=Modifier.fillMaxWidth().padding(top=10.dp)){Text("导入别人发来的盘点任务")}
+            companyTasks.firstOrNull()?.let{TextButton(onClick={onTask(it)},modifier=Modifier.padding(top=8.dp)){Text("查看历史盘点任务")}}
+        }
+    }else MainPage("盘点工作台", MainDestination.Scan, {}, onSettings) {
         if (activeTask != null) {
             val company = companies.firstOrNull { it.id == activeTask.companyId }
             Surface(Modifier.fillMaxWidth().clickable(enabled = activeCompanyTasks.size > 1) { chooseTask = true },
@@ -387,18 +389,7 @@ private fun HomeScreen(database: InventoryDatabase, companies: List<Company>, ta
                         Text("盘点人员：$operator",style=MaterialTheme.typography.bodySmall,modifier=Modifier.padding(top=4.dp))
                         Spacer(Modifier.height(14.dp)); Button({ onContinue(activeTask, operator) }, Modifier.fillMaxWidth()) { Icon(Icons.Rounded.QrCodeScanner,null);Spacer(Modifier.width(8.dp));Text("扫描区域二维码") }
                     }
-                    companyTasks.isNotEmpty() -> {
-                        Text("当前没有进行中的任务", style = MaterialTheme.typography.titleMedium)
-                        Text("可以查看最近任务的完成和导出状态。", Modifier.padding(top = 6.dp))
-                        Spacer(Modifier.height(14.dp)); Button({ onTask(companyTasks.first()) }, Modifier.fillMaxWidth()) { Text("查看最近任务") }
-                    }
-                    else -> {
-                        Text("还没有盘点任务", style = MaterialTheme.typography.titleMedium)
-                        Text("收到任务文件可直接导入；主手机可先创建公司、区域和任务。", Modifier.padding(top = 6.dp))
-                        Spacer(Modifier.height(14.dp)); Button(onImportTask, Modifier.fillMaxWidth()) { Text("导入别人发来的盘点任务") }
-                        if (companies.isNotEmpty()) TextButton({ onNewTask(companies.first()) }, Modifier.fillMaxWidth()) { Text("在本机创建盘点任务") }
-                        else TextButton(onSetup, Modifier.fillMaxWidth()) { Text("首次设置公司和区域") }
-                    }
+                    else -> Unit
                 }
             }
         }
@@ -412,7 +403,6 @@ private fun HomeScreen(database: InventoryDatabase, companies: List<Company>, ta
             }
             Spacer(Modifier.height(16.dp));Text("检查与处理",style=MaterialTheme.typography.titleMedium)
             PurposeEntry("查看区域进度","按区域核对数量、盘点人员和最后扫描时间",icon=Icons.Rounded.LocationOn){onSummary(recentTask)}
-            if(pendingCount>0)PurposeEntry("处理待确认事项","重复资产、异常资产和新增待入账资产",icon=Icons.Rounded.Rule){onPending(recentTask)}
         }
     }
     if (showOperator) AlertDialog(onDismissRequest = { if (operator.isNotBlank()) showOperator = false },
@@ -440,9 +430,9 @@ private fun PendingIssuesScreen(database: InventoryDatabase, task: InventoryTask
     Page("待处理问题", onBack) {
         Text("共 $total 项需要确认", style = MaterialTheme.typography.headlineSmall)
         Text("按问题类型进入对应明细，逐项核对和处理。", Modifier.padding(top = 6.dp, bottom = 16.dp))
-        if (duplicates > 0) PurposeEntry("重复资产", "$duplicates 项 · 确认保留区域或修改资产编号", onDuplicates)
-        if (summary.anomalies > 0) PurposeEntry("异常资产", "${summary.anomalies} 项 · 完善说明和现场照片", onAnomalies)
-        if (summary.newAssets > 0) PurposeEntry("新增待入账资产", "${summary.newAssets} 项 · 核对并转入正式台账", onNewAssets)
+        if (duplicates > 0) PurposeEntry("重复资产", "$duplicates 项 · 确认保留区域或修改资产编号",Icons.Rounded.ContentCopy,onDuplicates)
+        if (summary.anomalies > 0) PurposeEntry("异常资产", "${summary.anomalies} 项 · 完善说明和现场照片",Icons.Rounded.Warning,onAnomalies)
+        if (summary.newAssets > 0) PurposeEntry("新增待入账资产", "${summary.newAssets} 项 · 核对并转入正式台账",Icons.Rounded.AddCircle,onNewAssets)
         if (total == 0) EmptyState(Icons.Rounded.TaskAlt,"当前没有待处理问题","所有异常、重复和新增资产均已处理完成")
     }
 }
@@ -459,15 +449,15 @@ private fun PurposeEntry(title: String, description: String, icon:ImageVector?,o
 }
 
 @Composable
-private fun SettingsHomeScreen(company:Company?, tasks: List<InventoryTask>, ledgerCounts: Map<String,Int>,
-                               onScan: () -> Unit, onSetup: () -> Unit,
-                               onAreas: (Company) -> Unit, onNewTask: (Company) -> Unit,
-                               onTask: (InventoryTask) -> Unit, onLedger: (Company) -> Unit, onImportLedger: (Company) -> Unit,
+private fun SettingsHomeScreen(company:Company?, tasks: List<InventoryTask>,
+                               onScan: () -> Unit, onNewTask: (Company) -> Unit,
+                               onTask: (InventoryTask) -> Unit,
                                onExportTask: (InventoryTask) -> Unit, onExportResult: (InventoryTask) -> Unit,
-                               onImportTask: () -> Unit, onImportResult: () -> Unit, onBatchQr: (Company) -> Unit,
-                               onDeliveryStatus:(InventoryTask)->Unit,onBackup: () -> Unit) {
+                               onImportTask: () -> Unit, onImportResult: () -> Unit,
+                               onDeliveryStatus:(InventoryTask)->Unit) {
     val activeTask = tasks.firstOrNull { it.status == "进行中" }
-    MainPage("任务交付", MainDestination.Settings, onScan, {}) {
+    val recentClosedTask = tasks.firstOrNull { it.status == "已完成" || it.status == "已归档" }
+    MainPage(if(activeTask==null)"资产盘点" else "任务交付", MainDestination.Settings, onScan, {},showBottomBar=activeTask!=null,centerContent=activeTask==null) {
         if (activeTask != null) {
             Text(activeTask.name, style = MaterialTheme.typography.titleLarge)
             Text("完成负责区域后，在这里发送或汇总盘点数据。", Modifier.padding(top = 6.dp))
@@ -477,49 +467,53 @@ private fun SettingsHomeScreen(company:Company?, tasks: List<InventoryTask>, led
             Spacer(Modifier.height(18.dp))
             Text("负责人汇总", style = MaterialTheme.typography.titleMedium)
             PurposeEntry("发任务给盘点人员", "选择区域后使用面对面扫码或飞书、QQ 等方式发送",icon=Icons.Rounded.Assignment) { onExportTask(activeTask) }
-            PurposeEntry("汇总收到的盘点结果", "导入其他手机发回的结果文件") { onImportResult() }
-            PurposeEntry("查看区域交付情况", "核对各区域的本机盘点、回收状态和有效记录数") { onDeliveryStatus(activeTask) }
-            PurposeEntry("完成任务并导出总表", "处理待确认问题后生成 Excel") { onTask(activeTask) }
+            PurposeEntry("汇总收到的盘点结果", "导入其他手机发回的结果文件",icon=Icons.Rounded.MoveToInbox) { onImportResult() }
+            PurposeEntry("查看区域交付情况", "核对各区域的本机盘点、回收状态和有效记录数",icon=Icons.Rounded.FactCheck) { onDeliveryStatus(activeTask) }
+            PurposeEntry("完成任务并导出总表", "处理待确认问题后生成 Excel",icon=Icons.Rounded.TableView) { onTask(activeTask) }
         } else {
-            Text("还没有进行中的任务", style = MaterialTheme.typography.titleMedium)
-            PurposeEntry("接收盘点任务", "打开别人发来的 .invtask 文件") { onImportTask() }
-            company?.let{PurposeEntry("创建新的盘点任务", "使用 ${it.name} 的区域和台账") { onNewTask(it) }}
+            Icon(Icons.Rounded.FactCheck,null,tint=MaterialTheme.colorScheme.primary,modifier=Modifier.size(82.dp))
+            Spacer(Modifier.height(22.dp))
+            Text(if(company==null)"开始第一次资产盘点" else "开始一次新盘点", style = MaterialTheme.typography.headlineSmall)
+            Text(if(company==null)"先设置公司和区域，之后即可扫描盘点" else "创建任务后即可扫描区域和资产二维码",style=MaterialTheme.typography.bodyMedium,color=MaterialTheme.colorScheme.onSurfaceVariant,modifier=Modifier.padding(top=8.dp,bottom=20.dp))
+            company?.let{Button(onClick={onNewTask(it)},modifier=Modifier.fillMaxWidth()){Text("开始一次新盘点")}}
+            recentClosedTask?.let{task->
+                Spacer(Modifier.height(10.dp))
+                TextButton(onClick={onTask(task)}){Text("查看历史盘点任务")}
+            }
+            OutlinedButton(onClick=onImportTask,modifier=Modifier.fillMaxWidth().padding(top=10.dp)){Text("导入别人发来的盘点任务")}
         }
     }
 }
 
 @Composable
-private fun AssetCenterScreen(company:Company?,database:InventoryDatabase,onBack:()->Unit,onLedger:(Company)->Unit,onImport:(Company)->Unit,onPrint:(Company)->Unit){
-    Page("资产台账与标签",onBack){
-        if(company==null){Text("请先创建公司");return@Page}
-        Text("${company.name} · ${company.code}",style=MaterialTheme.typography.titleMedium)
-        Spacer(Modifier.height(16.dp));val count=database.ledgerAssetCount(company.id)
-        PurposeEntry(if(count==0)"导入资产台账" else "查看资产台账（$count 项）","查询资产详情并打印单枚二维码标签"){if(count==0)onImport(company)else onLedger(company)}
-        if(count>0)PurposeEntry("更新资产台账","追加或替换 Excel 台账"){onImport(company)}
-        PurposeEntry("批量生成与打印标签","批量选择资产或区域，使用 B3S_P 或 PDF 打印"){onPrint(company)}
-    }
-}
-
-@Composable
-private fun TaskPreparationScreen(company:Company?,tasks:List<InventoryTask>,database:InventoryDatabase,onBack:()->Unit,onAreas:(Company)->Unit,onNewTask:(Company)->Unit,onTask:(InventoryTask)->Unit,onEditCompany:(Company)->Unit,onAddCompany:()->Unit){
-    Page("任务与公司",onBack){
-        if(company!=null){Text("${company.name} · ${company.code}",style=MaterialTheme.typography.titleMedium);Spacer(Modifier.height(16.dp));PurposeEntry("创建盘点任务","使用当前公司的区域和台账"){onNewTask(company)};PurposeEntry("盘点区域","管理区域名称和区域二维码"){onAreas(company)};PurposeEntry("修改公司资料","修正公司名称或编号，保留旧编号兼容历史文件"){onEditCompany(company)}
+private fun TaskPreparationScreen(company:Company?,tasks:List<InventoryTask>,onBack:()->Unit,onAreas:(Company)->Unit,onNewTask:(Company)->Unit,onTask:(InventoryTask)->Unit){
+    var query by rememberSaveable(company?.id){mutableStateOf("")}
+    var status by rememberSaveable(company?.id){mutableStateOf("全部")}
+    Page("任务管理",onBack){
+        if(company!=null){Text("${company.name} · ${company.code}",style=MaterialTheme.typography.titleMedium);Spacer(Modifier.height(16.dp));PurposeEntry("创建盘点任务","使用当前公司的区域和台账",Icons.Rounded.AddTask){onNewTask(company)};PurposeEntry("盘点区域","管理区域名称和区域二维码",Icons.Rounded.LocationOn){onAreas(company)}
             val companyTasks=tasks.filter{it.companyId==company.id}
-            if(companyTasks.isNotEmpty()){Spacer(Modifier.height(18.dp));Text("已有盘点任务",style=MaterialTheme.typography.titleMedium);companyTasks.take(10).forEach{task->PurposeEntry(task.name,task.status){onTask(task)}}}
+            if(companyTasks.isNotEmpty()){
+                Spacer(Modifier.height(18.dp));Text("已有盘点任务",style=MaterialTheme.typography.titleMedium)
+                OutlinedTextField(query,{query=it},Modifier.fillMaxWidth().padding(top=8.dp),label={Text("搜索任务名称")},singleLine=true,leadingIcon={Icon(Icons.Rounded.Search,null)})
+                SingleChoiceSegmentedButtonRow(Modifier.fillMaxWidth().padding(vertical=10.dp)){
+                    listOf("全部","进行中","已完成","已归档").forEachIndexed{i,item->SegmentedButton(selected=status==item,onClick={status=item},shape=SegmentedButtonDefaults.itemShape(i,4)){Text(item)}}
+                }
+                val visible=companyTasks.filter{(status=="全部"||it.status==status)&&(query.isBlank()||it.name.contains(query,true))}
+                LazyColumn(Modifier.fillMaxWidth().weight(1f)){items(visible,key={it.id}){task->PurposeEntry(task.name,task.status,if(task.status=="进行中")Icons.Rounded.PendingActions else Icons.Rounded.AssignmentTurnedIn){onTask(task)}}}
+            }
         }
-        Spacer(Modifier.height(18.dp));Text("公司与数据",style=MaterialTheme.typography.titleMedium)
-        PurposeEntry("添加公司","创建另一家公司的独立资料",onAddCompany)
     }
 }
 
 @Composable
-private fun CompanyEditScreen(company:Company,ledgerCount:Int,areaCount:Int,taskCount:Int,defaultOperator:String,onBack:()->Unit,onSave:(String,String,String,String)->Unit){
+private fun CompanyEditScreen(company:Company,ledgerCount:Int,areaCount:Int,taskCount:Int,defaultOperator:String,onBack:()->Unit,onSave:(String,String,String,String)->Unit,onDelete:(String,String)->Unit){
     var code by remember(company.id){mutableStateOf(company.code)}
     var name by remember(company.id){mutableStateOf(company.name)}
     var operator by remember(company.id){mutableStateOf(defaultOperator)}
     var reason by remember(company.id){mutableStateOf("")}
     var error by remember{mutableStateOf<String?>(null)}
     var confirmDiscard by remember{mutableStateOf(false)}
+    var deleteStep by remember{mutableIntStateOf(0)}
     val changed=code.trim().uppercase()!=company.code||name.trim()!=company.name
     val dirty=changed||reason.isNotBlank()||(operator.isNotBlank()&&operator!=defaultOperator)
     val safeBack={if(dirty)confirmDiscard=true else onBack()}
@@ -537,18 +531,23 @@ private fun CompanyEditScreen(company:Company,ledgerCount:Int,areaCount:Int,task
         error?.let{Text(it,color=MaterialTheme.colorScheme.error,modifier=Modifier.padding(top=8.dp))}
         Spacer(Modifier.height(18.dp))
         Button(onClick={runCatching{onSave(code,name,operator,reason)}.onFailure{error=it.message?:"修改失败"}},enabled=changed&&code.isNotBlank()&&name.isNotBlank()&&operator.isNotBlank()&&reason.isNotBlank(),modifier=Modifier.fillMaxWidth()){Text("保存修改")}
+        Spacer(Modifier.height(28.dp));HorizontalDivider();Spacer(Modifier.height(16.dp))
+        OutlinedButton(onClick={deleteStep=1},colors=ButtonDefaults.outlinedButtonColors(contentColor=MaterialTheme.colorScheme.error),modifier=Modifier.fillMaxWidth()){Text("删除这家公司")}
     }
     DiscardChangesDialog(confirmDiscard,{confirmDiscard=false},{confirmDiscard=false;onBack()})
+    if(deleteStep==1)AlertDialog(onDismissRequest={deleteStep=0},title={Text("删除公司会清除全部相关数据")},text={Text("将删除 $ledgerCount 项台账资产、$areaCount 个区域、$taskCount 个盘点任务，以及这些任务的扫码记录和现场照片。删除前会自动生成 .invbackup 保护性备份。")},confirmButton={Button(onClick={deleteStep=2},colors=ButtonDefaults.buttonColors(containerColor=MaterialTheme.colorScheme.error)){Text("我已了解，继续")}},dismissButton={TextButton(onClick={deleteStep=0}){Text("取消")}})
+    if(deleteStep==2)DeleteConfirmationDialog("公司",company.name,defaultOperator,{deleteStep=0},onDelete)
 }
 
 @Composable
-private fun ImportLedgerScreen(database: InventoryDatabase, company: Company, operator: String, onBack: () -> Unit) {
+private fun ImportLedgerScreen(database: InventoryDatabase, company: Company, operator: String, onBack: () -> Unit,onDone:()->Unit) {
     val context = LocalContext.current
     val scope = rememberCoroutineScope()
     var parsed by remember { mutableStateOf<ParsedLedger?>(null) }
     var message by remember { mutableStateOf("请选择资产台账 Excel 文件") }
     var busy by remember { mutableStateOf(false) }
     var replaceMode by remember{mutableStateOf(false)}
+    var imported by remember{mutableStateOf(false)}
     val picker = rememberLauncherForActivityResult(ActivityResultContracts.OpenDocument()) { uri: Uri? ->
         if (uri != null) {
             busy = true; message = "正在读取台账…"
@@ -635,18 +634,19 @@ private fun ImportLedgerScreen(database: InventoryDatabase, company: Company, op
                 busy = true
                 scope.launch {
                     runCatching { withContext(Dispatchers.IO) { if(replaceMode){InventoryBackup.create(context,database);database.replaceLedger(company.id,ready,operator.ifBlank{"未填写"})}else database.importLedger(company.id,ready, operator.ifBlank { "未填写" }) } }
-                        .onSuccess { message = "导入成功：${ready.assets.size} 项资产，${ready.issues.size} 项留待处理"; parsed = null }
+                        .onSuccess { message = "导入成功：${ready.assets.size} 项资产，${ready.issues.size} 项留待处理";parsed=null;imported=true }
                         .onFailure { message = "导入失败：${it.message}" }
                     busy = false
                 }
             }, enabled = !busy && result.assets.isNotEmpty(), modifier = Modifier.fillMaxWidth()) { Text("确认导入有效资产") }
         }
+        if(imported){Spacer(Modifier.height(12.dp));Button(onClick=onDone,modifier=Modifier.fillMaxWidth()){Text("完成并查看资产台账")}}
         }
     }
 }
 
 @Composable
-private fun LedgerScreen(database: InventoryDatabase, company: Company, onBack: () -> Unit) {
+private fun LedgerScreen(database: InventoryDatabase, company: Company, onBack: () -> Unit,onImport:()->Unit,onBatchPrint:()->Unit) {
     val context=LocalContext.current
     var query by rememberSaveable(company.id) { mutableStateOf("") }
     var selected by remember { mutableStateOf<ImportedAsset?>(null) }
@@ -655,6 +655,11 @@ private fun LedgerScreen(database: InventoryDatabase, company: Company, onBack: 
     var history by remember{mutableStateOf(false)}
     val assets = remember(query) { database.ledgerAssets(company.id,query) }
     Page("${company.name} · 资产台账", onBack) {
+        Row(Modifier.fillMaxWidth(),horizontalArrangement=Arrangement.spacedBy(8.dp)){
+            OutlinedButton(onClick=onImport,modifier=Modifier.weight(1f)){Icon(Icons.Rounded.UploadFile,null);Spacer(Modifier.width(6.dp));Text(if(database.ledgerAssetCount(company.id)==0)"导入台账" else "更新台账")}
+            OutlinedButton(onClick=onBatchPrint,modifier=Modifier.weight(1f)){Icon(Icons.Rounded.Print,null);Spacer(Modifier.width(6.dp));Text("批量打印")}
+        }
+        Spacer(Modifier.height(8.dp))
         OutlinedTextField(
             value = query,
             onValueChange = { query = it },
@@ -677,7 +682,7 @@ private fun LedgerScreen(database: InventoryDatabase, company: Company, onBack: 
                             val summary = listOf(asset.name, asset.specification, asset.user, asset.department)
                                 .filter { it.isNotBlank() }.take(2).joinToString(" · ")
                             Text(summary.ifBlank { "暂无补充资料" })
-                        },
+                        },leadingContent={Icon(assetSemanticIcon(asset),assetSemanticLabel(asset),tint=MaterialTheme.colorScheme.primary)},
                         modifier = Modifier.clickable { selected = asset }
                     )
                     HorizontalDivider()
@@ -716,6 +721,22 @@ private fun LedgerScreen(database: InventoryDatabase, company: Company, onBack: 
     if(history)AlertDialog(onDismissRequest={history=false},title={Text("${company.name} · 台账导入历史")},text={val fmt=remember{SimpleDateFormat("yyyy-MM-dd HH:mm",Locale.CHINA)};LazyColumn(Modifier.heightIn(max=560.dp)){items(database.ledgerImports(company.id),key={it.id}){r->ListItem(headlineContent={Text(r.fileName)},supportingContent={Text("${fmt.format(Date(r.importedAt))} · ${r.operator}\n有效 ${r.valid} · 异常 ${r.issues}")});HorizontalDivider()}}},confirmButton={TextButton(onClick={history=false}){Text("关闭")}})
 }
 
+private fun assetSemanticText(asset:ImportedAsset)=listOf(asset.name,asset.category,asset.assetType,asset.specification).joinToString(" ").lowercase()
+private fun assetSemanticIcon(asset:ImportedAsset):ImageVector=when{
+    listOf("笔记本","notebook","laptop").any{it in assetSemanticText(asset)}->Icons.Rounded.LaptopMac
+    listOf("台式机","桌面电脑","desktop").any{it in assetSemanticText(asset)}->Icons.Rounded.Computer
+    listOf("显示器","monitor","屏幕").any{it in assetSemanticText(asset)}->Icons.Rounded.DesktopWindows
+    listOf("打印机","printer").any{it in assetSemanticText(asset)}->Icons.Rounded.Print
+    listOf("手机","电话","phone").any{it in assetSemanticText(asset)}->Icons.Rounded.Smartphone
+    listOf("平板","tablet").any{it in assetSemanticText(asset)}->Icons.Rounded.TabletMac
+    listOf("服务器","server").any{it in assetSemanticText(asset)}->Icons.Rounded.Dns
+    listOf("相机","摄像机","camera").any{it in assetSemanticText(asset)}->Icons.Rounded.PhotoCamera
+    else->Icons.Rounded.Inventory2
+}
+private fun assetSemanticLabel(asset:ImportedAsset)=when(assetSemanticIcon(asset)){
+    Icons.Rounded.LaptopMac->"笔记本电脑";Icons.Rounded.Computer->"台式电脑";Icons.Rounded.DesktopWindows->"显示器";Icons.Rounded.Print->"打印机";Icons.Rounded.Smartphone->"手机";Icons.Rounded.TabletMac->"平板电脑";Icons.Rounded.Dns->"服务器";Icons.Rounded.PhotoCamera->"相机";else->"资产"
+}
+
 @Composable
 private fun CompanySetupScreen(onBack: () -> Unit, onSave: (String, String) -> Unit) {
     var code by remember { mutableStateOf("") }; var name by remember { mutableStateOf("") }
@@ -737,7 +758,7 @@ private fun CompanySetupScreen(onBack: () -> Unit, onSave: (String, String) -> U
 
 @Composable
 private fun AreasScreen(company: Company, areas: List<Area>, onBack: () -> Unit,
-                        onAdd: (String, String) -> Unit, onUpdate: (Area, String, String) -> Unit) {
+                        onAdd: (String, String) -> Unit, onUpdate: (Area, String, String) -> Unit,onDone:()->Unit) {
     var code by remember { mutableStateOf("") }; var name by remember { mutableStateOf("") }
     var editing by remember { mutableStateOf<Area?>(null) }
     var qrArea by remember { mutableStateOf<Area?>(null) }
@@ -762,14 +783,11 @@ private fun AreasScreen(company: Company, areas: List<Area>, onBack: () -> Unit,
         error?.let { Text(it, color = MaterialTheme.colorScheme.error) }
         Spacer(Modifier.height(18.dp))
         Text("已有区域（${areas.size}）", style = MaterialTheme.typography.titleMedium)
-        areas.forEach { area ->
-            ListItem(
-                headlineContent = { Text(area.name) },
-                supportingContent = { Text("${area.code} · AREA:${area.code}") },
-                trailingContent = { Row { TextButton(onClick={qrArea=area}){Text("二维码")};TextButton(onClick = { editing = area }) { Text("编辑") } } }
-            )
+        LazyColumn(Modifier.fillMaxWidth().weight(1f)) { items(areas,key={it.id}) { area ->
+            ListItem(headlineContent = { Text(area.name) },supportingContent = { Text("${area.code} · AREA:${area.code}") },leadingContent={Icon(Icons.Rounded.LocationOn,"区域",tint=MaterialTheme.colorScheme.primary)},trailingContent = { Row { TextButton(onClick={qrArea=area}){Text("二维码")};TextButton(onClick = { editing = area }) { Text("编辑") } } })
             HorizontalDivider()
-        }
+        } }
+        if(areas.isNotEmpty()){Spacer(Modifier.height(10.dp));Button(onClick=onDone,modifier=Modifier.fillMaxWidth()){Text("区域添加完成，创建盘点任务")}}
     }
     DiscardChangesDialog(confirmDiscard,{confirmDiscard=false},{confirmDiscard=false;onBack()})
     editing?.let { area ->
@@ -813,17 +831,18 @@ private fun QrDisplayDialog(title:String,code:String,payload:String,onClose:()->
 }
 
 @Composable
-private fun NewTaskScreen(company: Company, areas: List<Area>, onBack: () -> Unit, onSave: (String) -> Unit) {
-    var name by remember { mutableStateOf("") }
+private fun NewTaskScreen(company: Company, areas: List<Area>, ledgerCount:Int,suggestedName:String,onBack: () -> Unit, onSave: (String) -> Unit) {
+    var name by remember(suggestedName) { mutableStateOf(suggestedName) }
     var confirmDiscard by remember{mutableStateOf(false)}
-    val safeBack={if(name.isNotBlank())confirmDiscard=true else onBack()}
+    val safeBack={if(name!=suggestedName)confirmDiscard=true else onBack()}
     Page("创建盘点任务", safeBack) {
         Text("公司：${company.name}")
         Text("将自动包含当前 ${areas.size} 个有效区域，无需重新填写。")
+        if(ledgerCount==0){Spacer(Modifier.height(10.dp));FeedbackBanner("当前公司尚未导入资产台账。仍可创建任务，但扫描到的资产都会标记为“新增待入账资产”。",FeedbackKind.WARNING)}
         Spacer(Modifier.height(16.dp))
-        OutlinedTextField(name, { name = it }, label = { Text("任务名称") }, modifier = Modifier.fillMaxWidth())
+        OutlinedTextField(name, { name = it }, label = { Text("任务名称（可选修改）") },supportingText={Text("系统已按公司和日期自动生成；同日重复会自动添加序号")}, modifier = Modifier.fillMaxWidth(),singleLine=true)
         Spacer(Modifier.height(16.dp))
-        Button(onClick = { onSave(name) }, enabled = name.isNotBlank() && areas.isNotEmpty(), modifier = Modifier.fillMaxWidth()) { Text("创建任务") }
+        Button(onClick = { onSave(name) }, enabled = areas.isNotEmpty(), modifier = Modifier.fillMaxWidth()) { Text("创建并开始盘点") }
         if (areas.isEmpty()) Text("请先返回并至少添加一个区域", color = MaterialTheme.colorScheme.error)
     }
     DiscardChangesDialog(confirmDiscard,{confirmDiscard=false},{confirmDiscard=false;onBack()})
@@ -831,12 +850,13 @@ private fun NewTaskScreen(company: Company, areas: List<Area>, onBack: () -> Uni
 
 @Composable
 private fun TaskDetailScreen(task: InventoryTask, areas: List<Area>, count: Int, operator: String,
-                             onBack: () -> Unit, onStart: (String) -> Unit, onRecords: () -> Unit,
-                             duplicateCount: Int, onDuplicates: () -> Unit, onSummary: () -> Unit, onExport: () -> Unit, onExportResult:()->Unit,onExportExcel:()->Unit,
-                             completionCheck:TaskCompletionCheck,onComplete:()->Unit,onArchive:()->Unit,onReopen:(String,String)->Unit) {
+                             onBack: () -> Unit, onRecords: () -> Unit,
+                             duplicateCount: Int, onDuplicates: () -> Unit, onSummary: () -> Unit,onExportExcel:()->Unit,
+                             completionCheck:TaskCompletionCheck,onComplete:()->Unit,onArchive:()->Unit,onReopen:(String,String)->Unit,onDelete:(String,String)->Unit) {
                              
     var confirmComplete by remember{mutableStateOf(false)}
     var reopen by remember{mutableStateOf(false)}
+    var deleteStep by remember{mutableIntStateOf(0)}
     Page(task.name, onBack) {
         Column(Modifier.fillMaxSize().verticalScroll(rememberScrollState())) {
         Text("状态：${task.status}")
@@ -844,19 +864,15 @@ private fun TaskDetailScreen(task: InventoryTask, areas: List<Area>, count: Int,
         Text("已盘点：$count 项", style = MaterialTheme.typography.headlineSmall)
         Spacer(Modifier.height(14.dp))
         Text("查看任务数据",style=MaterialTheme.typography.titleMedium)
-        PurposeEntry("盘点记录","查看扫码、异常、撤销和新增资产记录",onRecords)
-        PurposeEntry("区域进度","查看各区域数量、人员和最后扫描时间",onSummary)
-        if(duplicateCount>0)PurposeEntry("处理重复资产","$duplicateCount 个跨区域重复编号需要确认",onDuplicates)
-        if(task.status=="进行中"){
-            PurposeEntry("生成任务包","选择区域并发送给其他盘点手机",onExport)
-            PurposeEntry("发送本机盘点结果","生成 .invresult 结果文件",onExportResult)
-        }
+        PurposeEntry("盘点记录","查看扫码、异常、撤销和新增资产记录",Icons.Rounded.ReceiptLong,onRecords)
+        PurposeEntry("区域进度","查看各区域数量、人员和最后扫描时间",Icons.Rounded.LocationOn,onSummary)
+        if(duplicateCount>0)PurposeEntry("处理重复资产","$duplicateCount 个跨区域重复编号需要确认",Icons.Rounded.ContentCopy,onDuplicates)
         Spacer(Modifier.height(18.dp))
         Text("任务完成检查", style = MaterialTheme.typography.titleMedium)
         when(task.status){
             "进行中"->Button(onClick={confirmComplete=true},enabled=completionCheck.canComplete,modifier=Modifier.fillMaxWidth()){Text("完成盘点任务")}
             "已完成"->{Button(onClick=onExportExcel,modifier=Modifier.fillMaxWidth()){Text("导出 Excel 盘点总表")};Spacer(Modifier.height(10.dp));OutlinedButton(onClick=onArchive,modifier=Modifier.fillMaxWidth()){Text("归档任务")};TextButton(onClick={reopen=true}){Text("重新开启任务")}}
-            "已归档"->TextButton(onClick={reopen=true}){Text("重新开启归档任务")}
+            "已归档"->{Button(onClick=onExportExcel,modifier=Modifier.fillMaxWidth()){Text("导出 Excel 盘点总表")};Spacer(Modifier.height(10.dp));TextButton(onClick={reopen=true}){Text("重新开启归档任务")}}
         }
         if(!completionCheck.canComplete) {
             Text("暂时无法完成", color=MaterialTheme.colorScheme.error, style=MaterialTheme.typography.titleMedium)
@@ -864,12 +880,22 @@ private fun TaskDetailScreen(task: InventoryTask, areas: List<Area>, count: Int,
         }
         Spacer(Modifier.height(18.dp))
         Text("任务区域", style = MaterialTheme.typography.titleMedium)
-        areas.forEach { ListItem(headlineContent = { Text(it.name) }, supportingContent = { Text(it.code) }) }
+        areas.forEach { ListItem(headlineContent = { Text(it.name) }, supportingContent = { Text(it.code) },leadingContent={Icon(Icons.Rounded.LocationOn,"区域",tint=MaterialTheme.colorScheme.primary)}) }
+        Spacer(Modifier.height(24.dp));HorizontalDivider();Spacer(Modifier.height(16.dp))
+        OutlinedButton(onClick={deleteStep=1},colors=ButtonDefaults.outlinedButtonColors(contentColor=MaterialTheme.colorScheme.error),modifier=Modifier.fillMaxWidth()){Text("删除此任务")}
         Spacer(Modifier.height(24.dp))
         }
     }
     if(confirmComplete)AlertDialog(onDismissRequest={confirmComplete=false},title={Text("确认完成任务？")},text={Text("完成后将停止扫码和结果合并，但仍可查看并导出数据。")},confirmButton={Button(onClick={confirmComplete=false;onComplete()}){Text("确认完成")}},dismissButton={TextButton(onClick={confirmComplete=false}){Text("取消")}})
     if(reopen){var op by remember{mutableStateOf(operator)};var reason by remember{mutableStateOf("")};AlertDialog(onDismissRequest={reopen=false},title={Text("重新开启任务")},text={Column{OutlinedTextField(op,{op=it},label={Text("操作人")});OutlinedTextField(reason,{reason=it},label={Text("重新开启原因")})}},confirmButton={Button(onClick={onReopen(op,reason);reopen=false},enabled=op.isNotBlank()&&reason.isNotBlank()){Text("确认重新开启")}},dismissButton={TextButton(onClick={reopen=false}){Text("取消")}})}
+    if(deleteStep==1)AlertDialog(onDismissRequest={deleteStep=0},title={Text("删除盘点任务？")},text={Text("任务中的 $count 条有效盘点数据、扫码历史和现场照片将一并删除。删除前会自动生成 .invbackup 保护性备份。")},confirmButton={Button(onClick={deleteStep=2},colors=ButtonDefaults.buttonColors(containerColor=MaterialTheme.colorScheme.error)){Text("我已了解，继续")}},dismissButton={TextButton(onClick={deleteStep=0}){Text("取消")}})
+    if(deleteStep==2)DeleteConfirmationDialog("任务",task.name,operator,{deleteStep=0},onDelete)
+}
+
+@Composable
+private fun DeleteConfirmationDialog(type:String,targetName:String,defaultOperator:String,onCancel:()->Unit,onConfirm:(String,String)->Unit){
+    var typed by remember(targetName){mutableStateOf("")};var operator by remember{mutableStateOf(defaultOperator)};var reason by remember{mutableStateOf("")}
+    AlertDialog(onDismissRequest=onCancel,title={Text("最后确认删除$type")},text={Column{Text("请输入完整名称“$targetName”以确认。此操作不能在 App 内撤销。");Spacer(Modifier.height(10.dp));OutlinedTextField(typed,{typed=it},label={Text("输入${type}名称")},singleLine=true);Spacer(Modifier.height(8.dp));OutlinedTextField(operator,{operator=it},label={Text("操作人")},singleLine=true);Spacer(Modifier.height(8.dp));OutlinedTextField(reason,{reason=it},label={Text("删除原因")},minLines=2)}},confirmButton={Button(onClick={onConfirm(operator,reason);onCancel()},enabled=typed==targetName&&operator.isNotBlank()&&reason.isNotBlank(),colors=ButtonDefaults.buttonColors(containerColor=MaterialTheme.colorScheme.error)){Text("永久删除")}},dismissButton={TextButton(onClick=onCancel){Text("取消")}})
 }
 
 @Composable
@@ -881,7 +907,7 @@ private fun DeliveryStatusScreen(database:InventoryDatabase,task:InventoryTask,o
         Text("记录数用于辅助核对是否齐全；“已收到”只代表已经导入过该区域结果。",style=MaterialTheme.typography.bodySmall)
         Spacer(Modifier.height(12.dp))
         LazyColumn(Modifier.fillMaxWidth().weight(1f)){items(rows,key={it.area.id}){row->
-            ListItem(headlineContent={Text(row.area.name)},supportingContent={Text(buildString{append(row.area.code);append("\n主手机有效 ${row.localCount} · 收到有效 ${row.receivedCount}");row.resultReceivedAt?.let{append(" · 最近接收 ${fmt.format(Date(it))}")}})},trailingContent={Text(row.status?:"尚未回收",color=if(row.status=="尚未回收")MaterialTheme.colorScheme.error else MaterialTheme.colorScheme.primary)})
+            ListItem(headlineContent={Text(row.area.name)},leadingContent={Icon(if(row.status==null)Icons.Rounded.HourglassEmpty else Icons.Rounded.TaskAlt,"交付状态",tint=if(row.status==null)MaterialTheme.colorScheme.error else MaterialTheme.colorScheme.primary)},supportingContent={Text(buildString{append(row.area.code);append("\n主手机有效 ${row.localCount} · 收到有效 ${row.receivedCount}");row.resultReceivedAt?.let{append(" · 最近接收 ${fmt.format(Date(it))}")}})},trailingContent={Text(row.status?:"尚未回收",color=if(row.status=="尚未回收")MaterialTheme.colorScheme.error else MaterialTheme.colorScheme.primary)})
             HorizontalDivider()
         }}
     }
@@ -905,11 +931,24 @@ private fun BatchQrScreen(database:InventoryDatabase,company:Company,onBack:()->
 
 @Composable
 private fun BackupScreen(database:InventoryDatabase,onBack:()->Unit){
-    val context=LocalContext.current;val scope=rememberCoroutineScope();var message by remember{mutableStateOf("备份包含公司、区域、台账、任务、扫描、审计和异常照片")};var preview by remember{mutableStateOf<BackupPreview?>(null)};var confirmRestore by remember{mutableStateOf(false)}
+    val context=LocalContext.current;val scope=rememberCoroutineScope();var message by remember{mutableStateOf("备份包含公司、区域、台账、任务、扫描、审计和异常照片")};var preview by remember{mutableStateOf<BackupPreview?>(null)};var confirmRestore by remember{mutableStateOf(false)};var restoring by remember{mutableStateOf(false)};var refresh by remember{mutableIntStateOf(0)};var selectedFile by remember{mutableStateOf<File?>(null)};var selectedPreview by remember{mutableStateOf<BackupPreview?>(null)};var deleteFile by remember{mutableStateOf<File?>(null)};var pendingSave by remember{mutableStateOf<File?>(null)}
     val picker=rememberLauncherForActivityResult(ActivityResultContracts.OpenDocument()){uri:Uri?->if(uri!=null)scope.launch{runCatching{withContext(Dispatchers.IO){InventoryBackup.inspect(context,uri)}}.onSuccess{preview=it;message="备份校验通过"}.onFailure{message="读取失败：${it.message}"}}}
-    Page("完整备份与恢复",onBack){Text(message);Spacer(Modifier.height(14.dp));Button(onClick={runCatching{InventoryBackup.create(context,database)}.onSuccess{file->val uri=FileProvider.getUriForFile(context,"${context.packageName}.files",file);context.startActivity(Intent.createChooser(Intent(Intent.ACTION_SEND).apply{type="application/octet-stream";putExtra(Intent.EXTRA_STREAM,uri);addFlags(Intent.FLAG_GRANT_READ_URI_PERMISSION)},"分享完整备份（.invbackup）"));message="保护性备份已生成"}.onFailure{message="备份失败：${it.message}"}},modifier=Modifier.fillMaxWidth()){Text("生成并分享 .invbackup")};Spacer(Modifier.height(10.dp));OutlinedButton(onClick={picker.launch(arrayOf("application/octet-stream","application/zip","*/*"))},modifier=Modifier.fillMaxWidth()){Text("选择 .invbackup 恢复")};preview?.let{p->Spacer(Modifier.height(14.dp));Card(Modifier.fillMaxWidth()){Column(Modifier.padding(16.dp)){Text("备份内容",style=MaterialTheme.typography.titleMedium);Text("公司 ${p.companies} · 任务 ${p.tasks}");Text("台账 ${p.assets} · 扫码 ${p.scans} · 照片 ${p.photos}");Text(SimpleDateFormat("yyyy-MM-dd HH:mm:ss",Locale.CHINA).format(Date(p.createdAt)))}};Spacer(Modifier.height(10.dp));Button(onClick={confirmRestore=true},colors=ButtonDefaults.buttonColors(containerColor=MaterialTheme.colorScheme.error),modifier=Modifier.fillMaxWidth()){Text("用此备份替换当前全部数据")}}
+    val saver=rememberLauncherForActivityResult(ActivityResultContracts.CreateDocument("application/octet-stream")){uri:Uri?->val source=pendingSave;if(uri!=null&&source!=null)runCatching{context.contentResolver.openOutputStream(uri)?.use{out->source.inputStream().use{it.copyTo(out)}}?:error("无法写入所选位置")}.onSuccess{message="备份已保存到你选择的位置"}.onFailure{message="保存失败：${it.message}"};pendingSave=null}
+    fun share(file:File){val uri=FileProvider.getUriForFile(context,"${context.packageName}.files",file);context.startActivity(Intent.createChooser(Intent(Intent.ACTION_SEND).apply{type="application/octet-stream";putExtra(Intent.EXTRA_STREAM,uri);addFlags(Intent.FLAG_GRANT_READ_URI_PERMISSION)},"分享完整备份（.invbackup）"))}
+    val backups=remember(refresh){InventoryBackup.files(context)}
+    fun inspect(file:File){scope.launch{message="正在校验并读取备份…";runCatching{withContext(Dispatchers.IO){InventoryBackup.inspect(context,FileProvider.getUriForFile(context,"${context.packageName}.files",file))}}.onSuccess{selectedFile=file;selectedPreview=it;message="备份校验通过"}.onFailure{message="读取失败：${it.message}"}}}
+    Page("备份与恢复",onBack){Text(message);Spacer(Modifier.height(14.dp));Button(onClick={runCatching{InventoryBackup.create(context,database)}.onSuccess{file->refresh++;inspect(file);message="保护性备份已生成"}.onFailure{message="备份失败：${it.message}"}},modifier=Modifier.fillMaxWidth()){Text("生成保护性备份")};Spacer(Modifier.height(10.dp));OutlinedButton(onClick={picker.launch(arrayOf("application/octet-stream","application/zip","*/*"))},modifier=Modifier.fillMaxWidth()){Text("从其他位置选择备份")};Spacer(Modifier.height(18.dp));Text("App 内保存的备份（${backups.size}）",style=MaterialTheme.typography.titleMedium);Text("实际目录：${File(context.filesDir,"task_packages").absolutePath}",style=MaterialTheme.typography.bodySmall,color=MaterialTheme.colorScheme.onSurfaceVariant);Text("如需在文件管理器中查找，请使用“另存为”选择下载目录。",style=MaterialTheme.typography.bodySmall,color=MaterialTheme.colorScheme.onSurfaceVariant);Spacer(Modifier.height(8.dp));if(backups.isEmpty())Text("暂无保护性备份") else LazyColumn(Modifier.fillMaxWidth().weight(1f)){items(backups,key={it.absolutePath}){file->ListItem(headlineContent={Text(file.name)},supportingContent={Text("${SimpleDateFormat("yyyy-MM-dd HH:mm:ss",Locale.CHINA).format(Date(file.lastModified()))} · ${"%.1f".format(file.length()/1024.0/1024.0)} MB")},trailingContent={TextButton(onClick={inspect(file)}){Text("预览")}});Row(Modifier.fillMaxWidth().padding(horizontal=8.dp),horizontalArrangement=Arrangement.spacedBy(2.dp)){TextButton(onClick={share(file)}){Text("分享")};TextButton(onClick={pendingSave=file;saver.launch(file.name)}){Text("另存为")};TextButton(onClick={deleteFile=file},colors=ButtonDefaults.textButtonColors(contentColor=MaterialTheme.colorScheme.error)){Text("删除")}};HorizontalDivider()}};selectedFile?.let{file->selectedPreview?.let{p->AlertDialog(onDismissRequest={selectedFile=null;selectedPreview=null},title={Text("备份内容预览")},text={Column(Modifier.heightIn(max=560.dp).verticalScroll(rememberScrollState())){Text(file.name,style=MaterialTheme.typography.titleSmall);Text("生成时间：${SimpleDateFormat("yyyy-MM-dd HH:mm:ss",Locale.CHINA).format(Date(p.createdAt))}");Spacer(Modifier.height(8.dp));Text("公司 ${p.companies} · 任务 ${p.tasks}");Text("台账 ${p.assets} · 扫码 ${p.scans} · 照片 ${p.photos}");BackupDetailLists(p);Spacer(Modifier.height(8.dp));Text("大小：${"%.1f".format(file.length()/1024.0/1024.0)} MB");Text("路径：${file.absolutePath}",style=MaterialTheme.typography.bodySmall)}},confirmButton={Button(onClick={preview=p;selectedFile=null;selectedPreview=null},colors=ButtonDefaults.buttonColors(containerColor=MaterialTheme.colorScheme.error)){Text("准备恢复")}},dismissButton={Row{TextButton(onClick={share(file)}){Text("分享")};TextButton(onClick={selectedFile=null;selectedPreview=null}){Text("关闭")}}})}};preview?.let{p->Spacer(Modifier.height(14.dp));Card(Modifier.fillMaxWidth()){Column(Modifier.padding(16.dp)){Text("待恢复的备份内容",style=MaterialTheme.typography.titleMedium);Text("公司 ${p.companies} · 任务 ${p.tasks}");Text("台账 ${p.assets} · 扫码 ${p.scans} · 照片 ${p.photos}");Text(SimpleDateFormat("yyyy-MM-dd HH:mm:ss",Locale.CHINA).format(Date(p.createdAt)))}};Spacer(Modifier.height(10.dp));Button(onClick={confirmRestore=true},colors=ButtonDefaults.buttonColors(containerColor=MaterialTheme.colorScheme.error),modifier=Modifier.fillMaxWidth()){Text("用此备份替换当前全部数据")}}
     }
-    if(confirmRestore)AlertDialog(onDismissRequest={confirmRestore=false},title={Text("确认恢复完整备份？")},text={Text("当前数据将被备份中的数据替换，App随后自动重启。请确认已先导出当前保护性备份。")},confirmButton={Button(onClick={preview?.let{InventoryBackup.scheduleRestore(context,it)};confirmRestore=false;(context as? ComponentActivity)?.recreate()}){Text("确认替换并重启")}},dismissButton={TextButton(onClick={confirmRestore=false}){Text("取消")}})
+    deleteFile?.let{file->AlertDialog(onDismissRequest={deleteFile=null},title={Text("删除这份备份？")},text={Text("将永久删除 ${file.name}。如果尚未另存或分享，删除后将无法用于恢复。")},confirmButton={Button(onClick={if(file.delete()){message="备份已删除";refresh++}else message="备份删除失败";deleteFile=null},colors=ButtonDefaults.buttonColors(containerColor=MaterialTheme.colorScheme.error)){Text("确认删除")}},dismissButton={TextButton(onClick={deleteFile=null}){Text("取消")}})}
+    if(confirmRestore)AlertDialog(onDismissRequest={if(!restoring)confirmRestore=false},title={Text("确认恢复完整备份？")},text={Text(if(restoring)"正在备份恢复前的当前数据，请勿关闭 App…" else "恢复前会先自动生成一份当前数据的保护性备份。只有备份成功后才会替换数据并重启；若备份失败，恢复将自动中止。")},confirmButton={Button(onClick={val target=preview?:return@Button;restoring=true;scope.launch{runCatching{withContext(Dispatchers.IO){val protection=InventoryBackup.create(context,database);InventoryBackup.scheduleRestore(context,target);protection}}.onSuccess{confirmRestore=false;restoring=false;(context as? ComponentActivity)?.recreate()}.onFailure{restoring=false;confirmRestore=false;message="恢复已中止：无法生成恢复前保护性备份（${it.message}）"}}},enabled=!restoring){Text(if(restoring)"正在保护当前数据…" else "备份当前数据并恢复")}},dismissButton={TextButton(onClick={confirmRestore=false},enabled=!restoring){Text("取消")}})
+}
+
+@Composable
+private fun BackupDetailLists(preview:BackupPreview){
+    Spacer(Modifier.height(10.dp));Text("公司明细",style=MaterialTheme.typography.titleSmall)
+    preview.companyDetails.forEach{Text("• ${it.name}（${it.code}）")}
+    Spacer(Modifier.height(8.dp));Text("盘点任务",style=MaterialTheme.typography.titleSmall)
+    if(preview.taskDetails.isEmpty())Text("暂无盘点任务") else preview.taskDetails.forEach{Text("• ${it.name}\n  ${it.companyName} · ${it.status}")}
 }
 
 @Composable
@@ -926,12 +965,12 @@ private fun DiscardChangesDialog(visible:Boolean,onKeep:()->Unit,onDiscard:()->U
     if(visible) AlertDialog(onDismissRequest=onKeep,title={Text("放弃未保存的内容？")},text={Text("当前填写的内容尚未保存，返回后需要重新填写。")},confirmButton={Button(onClick=onDiscard,colors=ButtonDefaults.buttonColors(containerColor=MaterialTheme.colorScheme.error)){Text("放弃并返回")}},dismissButton={TextButton(onClick=onKeep){Text("继续编辑")}})
 }
 
-private enum class FeedbackKind{INFO,LOADING,SUCCESS,ERROR}
+private enum class FeedbackKind{INFO,LOADING,SUCCESS,WARNING,ERROR}
 
 @Composable
 private fun FeedbackBanner(message:String,kind:FeedbackKind){
-    val color=when(kind){FeedbackKind.INFO->MaterialTheme.colorScheme.surfaceVariant;FeedbackKind.LOADING->MaterialTheme.colorScheme.primaryContainer;FeedbackKind.SUCCESS->Color(0xFFC8E6C9);FeedbackKind.ERROR->Color(0xFFFFCDD2)}
-    val icon=when(kind){FeedbackKind.INFO->Icons.Rounded.Info;FeedbackKind.LOADING->Icons.Rounded.Sync;FeedbackKind.SUCCESS->Icons.Rounded.CheckCircle;FeedbackKind.ERROR->Icons.Rounded.Error}
+    val color=when(kind){FeedbackKind.INFO->MaterialTheme.colorScheme.surfaceVariant;FeedbackKind.LOADING->MaterialTheme.colorScheme.primaryContainer;FeedbackKind.SUCCESS->Color(0xFFC8E6C9);FeedbackKind.WARNING->Color(0xFFFFE0B2);FeedbackKind.ERROR->Color(0xFFFFCDD2)}
+    val icon=when(kind){FeedbackKind.INFO->Icons.Rounded.Info;FeedbackKind.LOADING->Icons.Rounded.Sync;FeedbackKind.SUCCESS->Icons.Rounded.CheckCircle;FeedbackKind.WARNING->Icons.Rounded.Warning;FeedbackKind.ERROR->Icons.Rounded.Error}
     Surface(Modifier.fillMaxWidth(),shape=RoundedCornerShape(12.dp),color=color){Row(Modifier.padding(14.dp),verticalAlignment=Alignment.CenterVertically){if(kind==FeedbackKind.LOADING)CircularProgressIndicator(Modifier.size(22.dp),strokeWidth=2.dp) else Icon(icon,null,modifier=Modifier.size(22.dp));Spacer(Modifier.width(10.dp));Text(message,Modifier.weight(1f),style=MaterialTheme.typography.bodyMedium)}}
 }
 
@@ -951,14 +990,17 @@ private fun NearbyTransferDialog(file:File,type:String,onClose:()->Unit){
 }
 
 @Composable
-private fun NearbyReceiveScreen(database:InventoryDatabase,onBack:()->Unit){
+private fun NearbyReceiveScreen(database:InventoryDatabase,onBack:()->Unit,onDone:()->Unit){
     val context=LocalContext.current;val scope=rememberCoroutineScope();var scanning by remember{mutableStateOf(true)};var link by remember{mutableStateOf<LocalTransferLink?>(null)};var code by remember{mutableStateOf("")};var message by remember{mutableStateOf("扫描发送手机显示的连接二维码")};var taskPkg by remember{mutableStateOf<OfflineTaskPackage?>(null)};var resultPkg by remember{mutableStateOf<ReadResultPackage?>(null)};var busy by remember{mutableStateOf(false)}
+    var networkAvailable by remember{mutableStateOf(localIpv4Address(context)!=null)}
+    LaunchedEffect(Unit){while(true){networkAvailable=localIpv4Address(context)!=null;delay(1000)}}
     Page("面对面扫码接收",onBack){
         Text("扫描另一台手机展示的发送二维码。两台手机需连接同一 Wi-Fi，或连接其中一台手机开启的热点。",style=MaterialTheme.typography.bodySmall,modifier=Modifier.padding(bottom=10.dp))
+        if(!networkAvailable)FeedbackBanner("当前未连接 Wi-Fi 或手机热点。请先连接网络，已扫描的连接码不会丢失。",FeedbackKind.WARNING)
         if(scanning)Box(Modifier.fillMaxWidth().weight(1f)){CameraScanner(onReady={},onError={message=it}){raw->runCatching{LocalTransferLink.parse(raw)}.onSuccess{link=it;scanning=false;message="请核对两台手机上的四位数字"}.onFailure{message=it.message?:"二维码无效"}}} else {
             Text(message);link?.let{l->Spacer(Modifier.height(12.dp));Text("文件：${l.name}");Text("大小：${l.size/1024} KB");OutlinedTextField(code,{code=it.filter(Char::isDigit).take(4)},label={Text("输入发送手机上的四位核对码")},singleLine=true,modifier=Modifier.fillMaxWidth());Button(onClick={busy=true;scope.launch{runCatching{withContext(Dispatchers.IO){val file=LocalPackageReceiver.download(context,l);if(l.type=="task")TaskPackageCodec.read(context,LocalPackageReceiver.uri(context,file)) else ResultPackageCodec.read(context,LocalPackageReceiver.uri(context,file))}}.onSuccess{if(it is OfflineTaskPackage)taskPkg=it else resultPkg=it as ReadResultPackage;message="下载和完整性校验通过"}.onFailure{message="接收失败：${it.message}"};busy=false}},enabled=code==l.code&&!busy,modifier=Modifier.fillMaxWidth()){Text(if(busy)"正在接收…" else "核对并接收")}}
-            taskPkg?.let{p->Card(Modifier.fillMaxWidth().padding(top=12.dp)){Column(Modifier.padding(16.dp)){Text(p.company.name,style=MaterialTheme.typography.titleMedium);Text(p.task.name);Text("区域：${p.areas.joinToString("、"){it.name}}");Text("台账：${p.assets.size} 项")}};Button(onClick={runCatching{database.importTaskPackage(p)}.onSuccess{message="任务已导入";taskPkg=null}.onFailure{message="导入失败：${it.message}"}},modifier=Modifier.fillMaxWidth()){Text("确认导入任务")}}
-            resultPkg?.let{r->val preview=runCatching{database.resultImportPreview(r.data)}.getOrNull();preview?.let{p->Card(Modifier.fillMaxWidth().padding(top=12.dp)){Column(Modifier.padding(16.dp)){Text(p.company.name,style=MaterialTheme.typography.titleMedium);Text(p.task.name);Text("记录 ${p.total} · 新增 ${p.newCount} · 已存在 ${p.existingCount}");Text("人员：${p.operators.joinToString("、")}")}};Button(onClick={runCatching{database.importResultPackage(r.data,r.extractedPhotos)}.onSuccess{message="盘点结果已合并";resultPkg=null}.onFailure{message="合并失败：${it.message}"}},enabled=p.newCount>0,modifier=Modifier.fillMaxWidth()){Text(if(p.newCount>0)"确认合并结果" else "记录均已存在")}}}
+            taskPkg?.let{p->Card(Modifier.fillMaxWidth().padding(top=12.dp)){Column(Modifier.padding(16.dp)){Text(p.company.name,style=MaterialTheme.typography.titleMedium);Text(p.task.name);Text("区域：${p.areas.joinToString("、"){it.name}}");Text("台账：${p.assets.size} 项")}};Button(onClick={runCatching{database.importTaskPackage(p)}.onSuccess{message="任务已导入";taskPkg=null;onDone()}.onFailure{message="导入失败：${it.message}"}},modifier=Modifier.fillMaxWidth()){Text("确认导入任务")}}
+            resultPkg?.let{r->val preview=runCatching{database.resultImportPreview(r.data)}.getOrNull();preview?.let{p->Card(Modifier.fillMaxWidth().padding(top=12.dp)){Column(Modifier.padding(16.dp)){Text(p.company.name,style=MaterialTheme.typography.titleMedium);Text(p.task.name);Text("记录 ${p.total} · 新增 ${p.newCount} · 已存在 ${p.existingCount}");Text("人员：${p.operators.joinToString("、")}")}};Button(onClick={runCatching{database.importResultPackage(r.data,r.extractedPhotos)}.onSuccess{message="盘点结果已合并";resultPkg=null;onDone()}.onFailure{message="合并失败：${it.message}"}},enabled=p.newCount>0,modifier=Modifier.fillMaxWidth()){Text(if(p.newCount>0)"确认合并结果" else "记录均已存在")}}}
         }
     }
 }
@@ -972,7 +1014,8 @@ private fun ExportTaskPackageScreen(database: InventoryDatabase, task: Inventory
     Page("发送盘点任务",onBack){
         Text(task.name,style=MaterialTheme.typography.titleMedium);Text(message)
         Spacer(Modifier.height(10.dp))
-        areas.forEach{area->Row(Modifier.fillMaxWidth().clickable{selected[area.id]=selected[area.id]!=true},verticalAlignment=Alignment.CenterVertically){Checkbox(selected[area.id]==true,{selected[area.id]=it});Column{Text(area.name);Text(area.code,style=MaterialTheme.typography.bodySmall)}}}
+        Row(Modifier.fillMaxWidth(),horizontalArrangement=Arrangement.End){TextButton(onClick={areas.forEach{selected[it.id]=true}}){Text("全选")};TextButton(onClick={areas.forEach{selected[it.id]=false}}){Text("清空")}}
+        LazyColumn(Modifier.fillMaxWidth().weight(1f)){items(areas,key={it.id}){area->Row(Modifier.fillMaxWidth().clickable{selected[area.id]=selected[area.id]!=true},verticalAlignment=Alignment.CenterVertically){Checkbox(selected[area.id]==true,{selected[area.id]=it});Column{Text(area.name);Text(area.code,style=MaterialTheme.typography.bodySmall)}}}}
         Spacer(Modifier.height(14.dp))
         if(file==null)Button(onClick={runCatching{TaskPackageCodec.create(context,database,task,areas.filter{selected[it.id]==true})}.onSuccess{file=it;message="任务包已生成，请选择发送方式"}.onFailure{message="生成失败：${it.message}"}},enabled=selected.values.any{it},modifier=Modifier.fillMaxWidth()){Text("确认区域并生成任务包")}
         file?.let{f->Spacer(Modifier.height(12.dp));Text("发送方式",style=MaterialTheme.typography.titleMedium);Button(onClick={nearby=true},modifier=Modifier.fillMaxWidth()){Icon(Icons.Rounded.QrCode2,null);Spacer(Modifier.width(8.dp));Text("面对面扫码发送")};OutlinedButton(onClick={val uri=FileProvider.getUriForFile(context,"${context.packageName}.files",f);context.startActivity(Intent.createChooser(Intent(Intent.ACTION_SEND).apply{type="application/octet-stream";putExtra(Intent.EXTRA_STREAM,uri);putExtra(Intent.EXTRA_SUBJECT,"资产盘点任务：${task.name}");addFlags(Intent.FLAG_GRANT_READ_URI_PERMISSION)},"通过其他应用发送"))},modifier=Modifier.fillMaxWidth()){Text("通过飞书、QQ 等应用发送")};if(nearby)NearbyTransferDialog(f,"task"){nearby=false}}
@@ -981,14 +1024,14 @@ private fun ExportTaskPackageScreen(database: InventoryDatabase, task: Inventory
 }
 
 @Composable
-private fun ImportTaskPackageScreen(database:InventoryDatabase,onBack:()->Unit){
+private fun ImportTaskPackageScreen(database:InventoryDatabase,onBack:()->Unit,onDone:()->Unit){
     val context=LocalContext.current;val scope=rememberCoroutineScope()
     var preview by remember{mutableStateOf<OfflineTaskPackage?>(null)};var message by remember{mutableStateOf("请选择从飞书、QQ或文件管理器收到的 .invtask 盘点任务包")};var busy by remember{mutableStateOf(false)}
     val picker=rememberLauncherForActivityResult(ActivityResultContracts.OpenDocument()){uri:Uri?->if(uri!=null){busy=true;scope.launch{runCatching{withContext(Dispatchers.IO){TaskPackageCodec.read(context,uri)}}.onSuccess{preview=it;message="任务包校验通过"}.onFailure{message="读取失败：${it.message}"};busy=false}}}
     Page("导入离线任务包",onBack){
         FeedbackBanner(message,feedbackKind(message,busy));Spacer(Modifier.height(12.dp));Button(onClick={picker.launch(arrayOf("application/octet-stream","application/zip","*/*"))},enabled=!busy,modifier=Modifier.fillMaxWidth()){Text(if(busy)"正在校验…" else "选择 .invtask 任务包")}
         preview?.let{pkg->Spacer(Modifier.height(14.dp));Card(Modifier.fillMaxWidth()){Column(Modifier.padding(16.dp)){Text(pkg.task.name,style=MaterialTheme.typography.titleMedium);Text("公司：${pkg.company.name}");Text("分配区域：${pkg.areas.joinToString("、"){it.name}}");Text("携带台账：${pkg.assets.size} 项");Text("任务包版本：${pkg.version}")}}
-            Spacer(Modifier.height(12.dp));Button(onClick={runCatching{database.importTaskPackage(pkg)}.onSuccess{message="导入成功，可返回首页开始盘点";preview=null}.onFailure{message="导入失败：${it.message}"}},modifier=Modifier.fillMaxWidth()){Text("确认导入任务")}
+            Spacer(Modifier.height(12.dp));Button(onClick={runCatching{database.importTaskPackage(pkg)}.onSuccess{message="导入成功";preview=null;onDone()}.onFailure{message="导入失败：${it.message}"}},modifier=Modifier.fillMaxWidth()){Text("确认导入并开始盘点")}
         }
     }
 }
@@ -1006,10 +1049,10 @@ private fun ExportExcelScreen(database:InventoryDatabase,task:InventoryTask,onBa
 }
 
 @Composable
-private fun ImportResultPackageScreen(database:InventoryDatabase,onBack:()->Unit){
+private fun ImportResultPackageScreen(database:InventoryDatabase,onBack:()->Unit,onDone:()->Unit){
     val context=LocalContext.current;val scope=rememberCoroutineScope();var read by remember{mutableStateOf<ReadResultPackage?>(null)};var preview by remember{mutableStateOf<ResultImportPreview?>(null)};var message by remember{mutableStateOf("请选择收到的 .invresult 盘点结果包")};var busy by remember{mutableStateOf(false)}
     val picker=rememberLauncherForActivityResult(ActivityResultContracts.OpenDocument()){uri:Uri?->if(uri!=null){busy=true;read=null;preview=null;scope.launch{runCatching{withContext(Dispatchers.IO){ResultPackageCodec.read(context,uri).also{database.resultImportPreview(it.data)}}}.onSuccess{r->read=r;preview=database.resultImportPreview(r.data);message="校验通过，请核对目标公司和任务"}.onFailure{message="不能导入：${it.message}"};busy=false}}}
-    Page("合并盘点结果",onBack){FeedbackBanner(message,feedbackKind(message,busy));Spacer(Modifier.height(12.dp));Button(onClick={picker.launch(arrayOf("application/octet-stream","application/zip","*/*"))},enabled=!busy,modifier=Modifier.fillMaxWidth()){Text(if(busy)"正在校验…" else "选择 .invresult 结果包")};read?.let{r->preview?.let{v->val p=r.data;Spacer(Modifier.height(14.dp));Card(Modifier.fillMaxWidth()){Column(Modifier.padding(16.dp),verticalArrangement=Arrangement.spacedBy(4.dp)){Text(v.company.name,style=MaterialTheme.typography.titleMedium);Text("公司编号：${v.company.code}");Text("目标任务：${v.task.name}");HorizontalDivider(Modifier.padding(vertical=6.dp));Text("来源设备：${p.deviceName}");Text("盘点人员：${v.operators.joinToString("、").ifBlank{"未填写"}}");Text("涉及区域：${v.areaNames.joinToString("、").ifBlank{"无记录"}}");Text("记录：${v.total} 条（新增 ${v.newCount}，已存在 ${v.existingCount}）");Text("异常照片：${r.extractedPhotos.values.sumOf{it.size}} 张")}};Spacer(Modifier.height(12.dp));Button(onClick={runCatching{database.importResultPackage(p,r.extractedPhotos)}.onSuccess{(added,skipped)->message="已合并到 ${v.company.name} / ${v.task.name}：新增 $added 条，已存在 $skipped 条";read=null;preview=null}.onFailure{message="合并失败：${it.message}"}},enabled=v.newCount>0,modifier=Modifier.fillMaxWidth()){Text(if(v.newCount>0)"确认合并到上述任务" else "所有记录均已合并，无需重复操作")}}}
+    Page("合并盘点结果",onBack){FeedbackBanner(message,feedbackKind(message,busy));Spacer(Modifier.height(12.dp));Button(onClick={picker.launch(arrayOf("application/octet-stream","application/zip","*/*"))},enabled=!busy,modifier=Modifier.fillMaxWidth()){Text(if(busy)"正在校验…" else "选择 .invresult 结果包")};read?.let{r->preview?.let{v->val p=r.data;Spacer(Modifier.height(14.dp));Card(Modifier.fillMaxWidth()){Column(Modifier.padding(16.dp),verticalArrangement=Arrangement.spacedBy(4.dp)){Text(v.company.name,style=MaterialTheme.typography.titleMedium);Text("公司编号：${v.company.code}");Text("目标任务：${v.task.name}");HorizontalDivider(Modifier.padding(vertical=6.dp));Text("来源设备：${p.deviceName}");Text("盘点人员：${v.operators.joinToString("、").ifBlank{"未填写"}}");Text("涉及区域：${v.areaNames.joinToString("、").ifBlank{"无记录"}}");Text("记录：${v.total} 条（新增 ${v.newCount}，已存在 ${v.existingCount}）");Text("异常照片：${r.extractedPhotos.values.sumOf{it.size}} 张")}};Spacer(Modifier.height(12.dp));Button(onClick={runCatching{database.importResultPackage(p,r.extractedPhotos)}.onSuccess{(added,skipped)->message="已合并到 ${v.company.name} / ${v.task.name}：新增 $added 条，已存在 $skipped 条";read=null;preview=null;onDone()}.onFailure{message="合并失败：${it.message}"}},enabled=v.newCount>0,modifier=Modifier.fillMaxWidth()){Text(if(v.newCount>0)"确认合并并查看任务" else "所有记录均已合并，无需重复操作")}}}
     }
 }
 
@@ -1023,7 +1066,7 @@ private fun MissingAssetsScreen(database: InventoryDatabase, task: InventoryTask
         OutlinedTextField(query, { query = it }, label = { Text("搜索编号、名称或部门") }, singleLine = true, modifier = Modifier.fillMaxWidth().padding(vertical = 10.dp))
         LazyColumn(Modifier.fillMaxWidth().weight(1f)) {
             items(visible, key = { it.code }) { asset ->
-                ListItem(headlineContent = { Text(asset.code) }, supportingContent = { Text(listOf(asset.name, asset.department).filter(String::isNotBlank).joinToString(" · ").ifBlank { "暂无补充资料" }) })
+                ListItem(headlineContent = { Text(asset.code) }, supportingContent = { Text(listOf(asset.name, asset.department).filter(String::isNotBlank).joinToString(" · ").ifBlank { "暂无补充资料" }) },leadingContent={Icon(assetSemanticIcon(asset),assetSemanticLabel(asset),tint=MaterialTheme.colorScheme.primary)})
                 HorizontalDivider()
             }
         }
@@ -1040,7 +1083,7 @@ private fun TaskSummaryScreen(database: InventoryDatabase, task: InventoryTask, 
         Spacer(Modifier.height(12.dp)); Text("各区域进度", style = MaterialTheme.typography.titleMedium)
         LazyColumn(Modifier.fillMaxWidth().weight(1f)) {
             items(progress, key = { it.code }) { area ->
-                ListItem(headlineContent = { Text(area.name) }, supportingContent = {
+                ListItem(headlineContent = { Text(area.name) }, leadingContent={Icon(Icons.Rounded.LocationOn,"区域",tint=MaterialTheme.colorScheme.primary)},supportingContent = {
                     Text("有效 ${area.valid} · 新增 ${area.newAssets} · 异常 ${area.anomalies}\n人员：${area.operators.ifBlank { "尚未开始" }}${area.lastScanAt?.let { " · 最近 ${dateFormat.format(Date(it))}" }.orEmpty()}")
                 })
                 HorizontalDivider()
@@ -1141,6 +1184,7 @@ private fun ScanRecordsScreen(database: InventoryDatabase, task: InventoryTask, 
                 ListItem(
                     headlineContent = { Text(record.assetCode) },
                     supportingContent = { Text("${record.areaName} · ${record.operatorName} · ${dateFormat.format(Date(record.scannedAt))}") },
+                    leadingContent={Icon(when{record.revokedAt!=null->Icons.Rounded.Undo;record.anomalyType.isNotBlank()->Icons.Rounded.Warning;record.duplicateInArea->Icons.Rounded.ContentCopy;record.outsideLedger->Icons.Rounded.AddCircle;else->Icons.Rounded.CheckCircle},"记录状态",tint=when{record.revokedAt!=null->Color.Gray;record.anomalyType.isNotBlank()->MaterialTheme.colorScheme.error;record.duplicateInArea||record.outsideLedger->Color(0xFFE65100);else->Color(0xFF2E7D32)})},
                     trailingContent = {
                         Text(when {
                             record.revokedAt != null -> "已撤销"
@@ -1421,9 +1465,10 @@ private fun spokenAssetCode(code: String): String {
 private fun CameraScanner(onReady: () -> Unit, onError: (String) -> Unit, onTorchReady:(((Boolean)->Unit)->Unit)={},onLuma:(Double)->Unit={},onValue: (String) -> Unit) {
     val context = LocalContext.current
     var granted by remember { mutableStateOf(ContextCompat.checkSelfPermission(context, Manifest.permission.CAMERA) == PackageManager.PERMISSION_GRANTED) }
-    val launcher = rememberLauncherForActivityResult(ActivityResultContracts.RequestPermission()) { granted = it }
+    var requested by rememberSaveable{mutableStateOf(false)}
+    val launcher = rememberLauncherForActivityResult(ActivityResultContracts.RequestPermission()) { granted = it;requested=true }
     LaunchedEffect(Unit) { if (!granted) launcher.launch(Manifest.permission.CAMERA) }
-    if (!granted) { Box(Modifier.fillMaxSize(), contentAlignment = Alignment.Center) { Text("需要相机权限才能扫描二维码") }; return }
+    if (!granted) { Box(Modifier.fillMaxSize().background(Color(0xFF202124)).padding(24.dp), contentAlignment = Alignment.Center) { Column(horizontalAlignment=Alignment.CenterHorizontally){Icon(Icons.Rounded.NoPhotography,null,tint=Color.White,modifier=Modifier.size(64.dp));Spacer(Modifier.height(16.dp));Text("扫码需要使用摄像头",color=Color.White,style=MaterialTheme.typography.titleLarge);Text(if(requested)"相机权限未允许，请到系统设置中开启后返回" else "允许后即可扫描区域和资产二维码",color=Color.White.copy(alpha=.8f),modifier=Modifier.padding(vertical=10.dp));Button(onClick={if(requested){context.startActivity(Intent(Settings.ACTION_APPLICATION_DETAILS_SETTINGS,Uri.parse("package:${context.packageName}")))}else{launcher.launch(Manifest.permission.CAMERA)}}){Text(if(requested)"打开系统设置" else "允许使用摄像头")}} }; return }
     val executor = remember { Executors.newSingleThreadExecutor() }
     val scanner = remember {
         BarcodeScanning.getClient(

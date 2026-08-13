@@ -1,4 +1,4 @@
-﻿plugins {
+plugins {
     id("com.android.application")
     id("org.jetbrains.kotlin.plugin.compose")
 }
@@ -11,8 +11,8 @@ android {
         applicationId = "cn.assetinventory.app"
         minSdk = 29
         targetSdk = 37
-        versionCode = 106
-        versionName = "1.1.0-beta6"
+        versionCode = 124
+        versionName = "1.1.0-beta24"
     }
 
     buildFeatures { compose = true; buildConfig = true }
