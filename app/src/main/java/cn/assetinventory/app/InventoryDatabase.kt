@@ -550,6 +550,13 @@ class InventoryDatabase(context: Context) :
         GROUP BY asset_code HAVING COUNT(DISTINCT area_code)>1 ORDER BY asset_code
     """.trimIndent(), arrayOf(taskId)).use { c -> buildList { while (c.moveToNext()) add(c.getString(0)) } }
 
+    fun activeOtherAreaNames(taskId:String,assetCode:String,currentAreaCode:String):List<String> = readableDatabase.rawQuery("""
+        SELECT DISTINCT COALESCE(ta.area_name_snapshot,s.area_code)
+        FROM scan_event s LEFT JOIN task_area ta ON ta.task_id=s.task_id AND ta.area_code_snapshot=s.area_code
+        WHERE s.task_id=? AND s.asset_code=? AND s.area_code<>? AND s.duplicate_in_area=0 AND s.revoked_at IS NULL
+        ORDER BY s.scanned_at DESC
+    """.trimIndent(),arrayOf(taskId,assetCode,currentAreaCode)).use{c->buildList{while(c.moveToNext())add(c.getString(0))}}
+
     fun correctAssetCode(id: Long, newCode: String, operator: String, reason: String) {
         val code = XlsxImporter.normalizedCode(newCode)
         require(XlsxImporter.isValidCode(code) && operator.isNotBlank() && reason.isNotBlank())

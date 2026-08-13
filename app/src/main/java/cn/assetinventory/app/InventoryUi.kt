@@ -1263,10 +1263,11 @@ private fun ScannerScreen(database: InventoryDatabase, task: InventoryTask, init
     var lastSeenAt by remember { mutableLongStateOf(0L) }
     var handover by remember { mutableStateOf(false) }
     var confirmExit by remember { mutableStateOf(false) }
+    var hintSpoken by remember { mutableStateOf(false) }
 
     BackHandler { confirmExit = true }
 
-    LaunchedEffect(Unit) { speak("语音播报已启动") }
+    LaunchedEffect(Unit) { speak("请扫描区域二维码");delay(8000);if(area==null&&!hintSpoken){hintSpoken=true;speak("请先扫描区域二维码")} }
 
     Box(Modifier.fillMaxSize()) {
         CameraScanner(onReady = {
@@ -1282,12 +1283,13 @@ private fun ScannerScreen(database: InventoryDatabase, task: InventoryTask, init
                     if (found == null) {
                         message = "该区域未分配给当前任务：${payload.code}"
                         statusColor = Color(0xFFFFE0B2)
-                        speak("区域未分配")
+                        speak("该区域不属于当前任务，请重新扫描区域二维码")
                     } else {
+                        val switching=area!=null&&area?.code!=found.code
                         area = found; count = database.validCount(task.id, found.code)
-                        message = "已进入区域：${found.name}"
+                        message = "${if(switching)"已切换到" else "已进入"}${found.name}\n请连续扫描资产二维码"
                         statusColor = Color(0xFFC8E6C9)
-                        speak("已进入，${found.name}")
+                        speak("${if(switching)"已切换到" else "已进入"}${found.name}，请扫描资产二维码")
                     }
                 }
                 is QrPayload.Asset -> {
@@ -1299,22 +1301,27 @@ private fun ScannerScreen(database: InventoryDatabase, task: InventoryTask, init
                     }
                     else runCatching { database.recordScan(task.id, selected.code, payload.code, raw, operator) }
                         .onSuccess { result ->
+                            val otherAreas=if(result.duplicateInArea)emptyList() else database.activeOtherAreaNames(task.id,result.assetCode,selected.code)
+                            val crossRegion=otherAreas.isNotEmpty()
                             if (!result.duplicateInArea) count++ else duplicateCount++
                             message = when {
                                 result.duplicateInArea -> "本区域重复：${result.assetCode}"
+                                crossRegion -> "其他区域已扫描：${result.assetCode}\n${otherAreas.joinToString("、")} · 当前区域仍计入，结束后确认位置"
                                 result.outsideLedger -> "已盘点：${result.assetCode}\n新增待入账资产"
                                 else -> "已盘点：${result.assetCode}"
                             }
-                            statusColor = if (result.duplicateInArea || result.outsideLedger) Color(0xFFFFE0B2) else Color(0xFFC8E6C9)
+                            statusColor = if (result.duplicateInArea || result.outsideLedger || crossRegion) Color(0xFFFFE0B2) else Color(0xFFC8E6C9)
                             val spoken = spokenAssetCode(result.assetCode)
-                            speak(if (result.duplicateInArea) "重复，$spoken" else spoken)
+                            speak(when{result.duplicateInArea->"重复，$spoken";crossRegion->"其他区域已扫描，$spoken";result.outsideLedger->"新增资产，$spoken";else->spoken})
                             val recentItem = when {
                                 result.duplicateInArea -> "${result.assetCode} · 重复"
+                                crossRegion -> "${result.assetCode} · 跨区域待确认"
                                 result.outsideLedger -> "${result.assetCode} · 新增待入账"
                                 else -> "${result.assetCode} · 成功"
                             }
                             recent = (listOf(recentItem) + recent).take(3)
-                            context.getSystemService(Vibrator::class.java)?.vibrate(VibrationEffect.createOneShot(if (result.duplicateInArea) 180 else 60, VibrationEffect.DEFAULT_AMPLITUDE))
+                            val vibrator=context.getSystemService(Vibrator::class.java)
+                            if(result.outsideLedger&&!result.duplicateInArea&&!crossRegion)vibrator?.vibrate(VibrationEffect.createWaveform(longArrayOf(0,60,70,60),-1)) else vibrator?.vibrate(VibrationEffect.createOneShot(if(result.duplicateInArea||crossRegion)180 else 60,VibrationEffect.DEFAULT_AMPLITUDE))
                         }.onFailure {
                             message = "保存失败，扫描已暂停"
                             statusColor = Color(0xFFFFCDD2)
@@ -1331,11 +1338,11 @@ private fun ScannerScreen(database: InventoryDatabase, task: InventoryTask, init
         }
         Column(Modifier.fillMaxWidth().align(Alignment.TopCenter).background(Color(0xE6072F2B)).statusBarsPadding().padding(16.dp)) {
             Text(task.name, color = Color.White, style = MaterialTheme.typography.titleMedium)
-            Text("人员：$operator", color = Color.White)
-            Text("区域：${area?.name ?: "未选择"}", color = Color.White)
-            Text("已盘：$count    重复：$duplicateCount", color = Color.White, style = MaterialTheme.typography.headlineSmall)
-            Text("语音：$voiceStatus", color = if (voiceStatus == "正常") Color(0xFFB9F6CA) else Color(0xFFFFCC80))
+            Row(Modifier.fillMaxWidth(),horizontalArrangement=Arrangement.SpaceBetween){Text("人员：$operator",color=Color.White);Text("语音：$voiceStatus",color=if(voiceStatus=="正常")Color(0xFFB9F6CA) else Color(0xFFFFCC80))}
+            Text("区域：${area?.name ?: "等待扫描区域"}", color = Color.White,style=MaterialTheme.typography.titleMedium)
+            Row(Modifier.padding(top=6.dp),horizontalArrangement=Arrangement.spacedBy(16.dp)){Column{Text("$count",color=Color.White,style=MaterialTheme.typography.headlineSmall);Text("已盘点",color=Color.White.copy(alpha=.8f),style=MaterialTheme.typography.labelSmall)};Column{Text("$duplicateCount",color=Color.White,style=MaterialTheme.typography.headlineSmall);Text("本区重复",color=Color.White.copy(alpha=.8f),style=MaterialTheme.typography.labelSmall)}}
         }
+        Surface(Modifier.align(Alignment.Center).padding(horizontal=32.dp),shape=RoundedCornerShape(18.dp),color=Color(0xB8000000),border=androidx.compose.foundation.BorderStroke(2.dp,if(area==null)Color(0xFF80CBC4) else Color(0xFFA5D6A7))){Column(Modifier.padding(horizontal=24.dp,vertical=18.dp),horizontalAlignment=Alignment.CenterHorizontally){Icon(if(area==null)Icons.Rounded.LocationOn else Icons.Rounded.QrCodeScanner,null,tint=Color.White,modifier=Modifier.size(34.dp));Spacer(Modifier.height(6.dp));Text(if(area==null)"请扫描区域二维码" else "${area?.name} · 连续扫描资产",color=Color.White,style=MaterialTheme.typography.titleMedium);Text(if(area==null)"格式：AREA:区域编号" else "二维码进入识别框即可自动计入",color=Color.White.copy(alpha=.82f),style=MaterialTheme.typography.bodySmall)}}
         val animatedStatusColor by animateColorAsState(statusColor,tween(220,easing=FastOutSlowInEasing),label="扫码状态颜色")
         Surface(Modifier.align(Alignment.BottomCenter).fillMaxWidth().padding(16.dp), shape = RoundedCornerShape(16.dp), color = animatedStatusColor,shadowElevation=6.dp) {
             Column(Modifier.padding(18.dp)) {
@@ -1357,7 +1364,7 @@ private fun ScannerScreen(database: InventoryDatabase, task: InventoryTask, init
                   }
                 }
                 Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
-                    OutlinedButton(onClick = { area = null; message = "请扫描新的区域二维码" }) { Text("切换区域") }
+                    OutlinedButton(onClick = { area = null; message = "请扫描新的区域二维码";statusColor=Color(0xFFB2DFDB);speak("请扫描区域二维码") }) { Text("切换区域") }
                     OutlinedButton(onClick = { handover = true }) { Text("人员交接") }
                     TextButton(onClick = { confirmExit = true }) { Text("结束扫描") }
                 }
@@ -1373,6 +1380,7 @@ private fun ScannerScreen(database: InventoryDatabase, task: InventoryTask, init
                 operator = next.trim()
                 sessionId = database.startSession(task.id, operator)
                 handover = false
+                speak("已切换盘点人员，${operator}，请继续扫描")
             }, enabled = next.isNotBlank()) { Text("确认交接") } },
             dismissButton = { TextButton(onClick = { handover = false }) { Text("取消") } })
     }
