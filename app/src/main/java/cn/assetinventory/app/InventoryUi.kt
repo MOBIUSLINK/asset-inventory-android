@@ -190,7 +190,7 @@ fun InventoryRoot(database: InventoryDatabase, voiceStatus: String, speak: (Stri
             defaultOperator=operator,
             onBack={goBack()},
             onSave={code,name,who,reason->runCatching{database.updateCompany(current.company.id,code,name,who,reason)}.onSuccess{prefs.edit().putString("operator",who.trim()).apply();refresh++;goBack();notify("公司资料已保存")}.onFailure{notify("保存失败：${it.message}")}},
-            onDelete={who,reason->runCatching{val backup=InventoryBackup.create(context,database);database.deleteCompany(current.company.id,who,reason);backup.name}.onSuccess{prefs.edit().remove("current_company_id").remove("current_task_id").putString("operator",who.trim()).apply();refresh++;navigateRoot(Screen.Home);notify("公司已删除，保护性备份：$it")}.onFailure{notify("删除失败：${it.message}")}}
+            onDelete={who,reason->runCatching{val backup=InventoryBackup.create(context,database,"删除公司前保护","COMPANY",current.company.name);database.deleteCompany(current.company.id,who,reason);backup.name}.onSuccess{prefs.edit().remove("current_company_id").remove("current_task_id").putString("operator",who.trim()).apply();refresh++;navigateRoot(Screen.Home);notify("公司已删除，保护性备份：$it")}.onFailure{notify("删除失败：${it.message}")}}
         )
         Screen.SettingsHome -> SettingsHomeScreen(
             company = selectedCompany,
@@ -247,7 +247,7 @@ fun InventoryRoot(database: InventoryDatabase, voiceStatus: String, speak: (Stri
             onDuplicates = { navigate(Screen.Duplicates(current.task)) },
             onExportExcel={navigate(Screen.ExportExcel(current.task))},
             completionCheck=remember(refresh){database.taskCompletionCheck(current.task.id)},onComplete={database.completeTask(current.task.id);prefs.edit().remove("current_task_id").apply();refresh++;notify("盘点任务已完成，可导出 Excel")},onArchive={database.archiveTask(current.task.id);prefs.edit().remove("current_task_id").apply();refresh++;notify("任务已归档，仍可查看和导出")},onReopen={op,reason->database.reopenTask(current.task.id,op,reason);prefs.edit().putString("current_task_id",current.task.id).apply();refresh++;notify("任务已重新开启")},
-            onDelete={who,reason->runCatching{val backup=InventoryBackup.create(context,database);database.deleteTask(current.task.id,who,reason);backup.name}.onSuccess{prefs.edit().remove("current_task_id").putString("operator",who.trim()).apply();refresh++;navigateRoot(Screen.Home);notify("任务已删除，保护性备份：$it")}.onFailure{notify("删除失败：${it.message}")}}
+            onDelete={who,reason->runCatching{val backup=InventoryBackup.create(context,database,"删除任务前保护","TASK",current.task.name);database.deleteTask(current.task.id,who,reason);backup.name}.onSuccess{prefs.edit().remove("current_task_id").putString("operator",who.trim()).apply();refresh++;navigateRoot(Screen.Home);notify("任务已删除，保护性备份：$it")}.onFailure{notify("删除失败：${it.message}")}}
         )
         is Screen.ScanRecords -> ScanRecordsScreen(database, current.task, operator, current.filter) {
             refresh++; goBack()
@@ -634,7 +634,7 @@ private fun ImportLedgerScreen(database: InventoryDatabase, company: Company, op
                 val ready = result.copy(assets = result.assets + repaired, issues = remaining)
                 busy = true
                 scope.launch {
-                    runCatching { withContext(Dispatchers.IO) { if(replaceMode){InventoryBackup.create(context,database);database.replaceLedger(company.id,ready,operator.ifBlank{"未填写"})}else database.importLedger(company.id,ready, operator.ifBlank { "未填写" }) } }
+                    runCatching { withContext(Dispatchers.IO) { if(replaceMode){InventoryBackup.create(context,database,"替换台账前保护","COMPANY",company.name);database.replaceLedger(company.id,ready,operator.ifBlank{"未填写"})}else database.importLedger(company.id,ready, operator.ifBlank { "未填写" }) } }
                         .onSuccess { message = "导入成功：${ready.assets.size} 项资产，${ready.issues.size} 项留待处理";parsed=null;imported=true }
                         .onFailure { message = "导入失败：${it.message}" }
                     busy = false
@@ -946,6 +946,109 @@ private fun BatchQrScreen(database:InventoryDatabase,company:Company,onBack:()->
 
 @Composable
 private fun BackupScreen(database:InventoryDatabase,onBack:()->Unit){
+    val context=LocalContext.current
+    val scope=rememberCoroutineScope()
+    var message by remember{mutableStateOf("备份包含全部公司、台账、任务、盘点记录和异常照片")}
+    var refresh by remember{mutableIntStateOf(0)}
+    var selected by remember{mutableStateOf<BackupPreview?>(null)}
+    var fullRestore by remember{mutableStateOf<BackupPreview?>(null)}
+    var companyRestore by remember{mutableStateOf<Pair<BackupPreview,BackupCompany>?>(null)}
+    var taskRestore by remember{mutableStateOf<Pair<BackupPreview,BackupTask>?>(null)}
+    var deleteFile by remember{mutableStateOf<File?>(null)}
+    var pendingSave by remember{mutableStateOf<File?>(null)}
+    var busy by remember{mutableStateOf(false)}
+
+    val picker=rememberLauncherForActivityResult(ActivityResultContracts.OpenDocument()){uri:Uri?->
+        if(uri!=null)scope.launch{
+            runCatching{withContext(Dispatchers.IO){InventoryBackup.inspect(context,uri)}}
+                .onSuccess{selected=it;message="备份校验通过"}
+                .onFailure{message="读取失败：${it.message}"}
+        }
+    }
+    val saver=rememberLauncherForActivityResult(ActivityResultContracts.CreateDocument("application/octet-stream")){uri:Uri?->
+        val source=pendingSave
+        if(uri!=null&&source!=null)runCatching{
+            context.contentResolver.openOutputStream(uri)?.use{out->source.inputStream().use{it.copyTo(out)}}?:error("无法写入所选位置")
+        }.onSuccess{message="备份已保存到所选位置"}.onFailure{message="保存失败：${it.message}"}
+        pendingSave=null
+    }
+    fun share(file:File){
+        val uri=FileProvider.getUriForFile(context,"${context.packageName}.files",file)
+        context.startActivity(Intent.createChooser(Intent(Intent.ACTION_SEND).apply{
+            type="application/octet-stream";putExtra(Intent.EXTRA_STREAM,uri);addFlags(Intent.FLAG_GRANT_READ_URI_PERMISSION)
+        },"分享完整备份（.invbackup）"))
+    }
+    fun inspect(file:File){
+        scope.launch{
+            message="正在校验并读取备份…"
+            runCatching{withContext(Dispatchers.IO){InventoryBackup.inspect(context,FileProvider.getUriForFile(context,"${context.packageName}.files",file))}}
+                .onSuccess{selected=it;message="备份校验通过"}
+                .onFailure{message="读取失败：${it.message}"}
+        }
+    }
+    val backups=remember(refresh){InventoryBackup.files(context)}
+    Page("备份与恢复",onBack){
+        Text(message)
+        Spacer(Modifier.height(14.dp))
+        Button(onClick={runCatching{InventoryBackup.create(context,database)}.onSuccess{refresh++;inspect(it)}.onFailure{message="备份失败：${it.message}"}},modifier=Modifier.fillMaxWidth()){Text("生成完整保护性备份")}
+        Spacer(Modifier.height(10.dp))
+        OutlinedButton(onClick={picker.launch(arrayOf("application/octet-stream","application/zip","*/*"))},modifier=Modifier.fillMaxWidth()){Text("从其他位置选择备份")}
+        Spacer(Modifier.height(18.dp))
+        Text("App 内保存的备份（${backups.size}）",style=MaterialTheme.typography.titleMedium)
+        Text("实际目录：${File(context.filesDir,"task_packages").absolutePath}",style=MaterialTheme.typography.bodySmall,color=MaterialTheme.colorScheme.onSurfaceVariant)
+        Spacer(Modifier.height(8.dp))
+        if(backups.isEmpty()) Text("暂无保护性备份") else LazyColumn(Modifier.fillMaxWidth().weight(1f)){
+            items(backups,key={it.absolutePath}){file->
+                ListItem(headlineContent={Text(file.name)},supportingContent={Text("${SimpleDateFormat("yyyy-MM-dd HH:mm:ss",Locale.CHINA).format(Date(file.lastModified()))} · ${"%.1f".format(file.length()/1024.0/1024.0)} MB")},trailingContent={TextButton(onClick={inspect(file)}){Text("预览")}})
+                Row(Modifier.fillMaxWidth().padding(horizontal=8.dp),horizontalArrangement=Arrangement.spacedBy(2.dp)){
+                    TextButton(onClick={share(file)}){Text("分享")}
+                    TextButton(onClick={pendingSave=file;saver.launch(file.name)}){Text("另存为")}
+                    TextButton(onClick={deleteFile=file},colors=ButtonDefaults.textButtonColors(contentColor=MaterialTheme.colorScheme.error)){Text("删除")}
+                }
+                HorizontalDivider()
+            }
+        }
+    }
+    selected?.let{p->
+        AlertDialog(onDismissRequest={selected=null},title={Text("备份内容预览")},text={
+            Column(Modifier.heightIn(max=560.dp).verticalScroll(rememberScrollState())){
+                Text(p.file.name,style=MaterialTheme.typography.titleSmall)
+                Text("创建原因：${p.reason}")
+                Text("针对对象：${p.targetName}")
+                Text("生成时间：${SimpleDateFormat("yyyy-MM-dd HH:mm:ss",Locale.CHINA).format(Date(p.createdAt))}")
+                Spacer(Modifier.height(8.dp));Text("公司 ${p.companies} · 任务 ${p.tasks}");Text("台账 ${p.assets} · 扫码 ${p.scans} · 照片 ${p.photos}")
+                BackupDetailLists(p,onCompany={companyRestore=p to it;selected=null},onTask={taskRestore=p to it;selected=null})
+                Spacer(Modifier.height(8.dp));Text("备份范围始终为全部公司和全部数据",style=MaterialTheme.typography.bodySmall,color=MaterialTheme.colorScheme.onSurfaceVariant)
+            }
+        },confirmButton={Button(onClick={fullRestore=p;selected=null},colors=ButtonDefaults.buttonColors(containerColor=MaterialTheme.colorScheme.error)){Text("恢复全部数据")}},dismissButton={TextButton(onClick={selected=null}){Text("关闭")}})
+    }
+    deleteFile?.let{file->AlertDialog(onDismissRequest={deleteFile=null},title={Text("删除这份备份？")},text={Text("将永久删除 ${file.name}。")},confirmButton={Button(onClick={if(file.delete()){message="备份已删除";refresh++}else message="备份删除失败";deleteFile=null},colors=ButtonDefaults.buttonColors(containerColor=MaterialTheme.colorScheme.error)){Text("确认删除")}},dismissButton={TextButton(onClick={deleteFile=null}){Text("取消")}})}
+    fullRestore?.let{p->RestoreConfirmDialog("恢复全部数据？","当前全部数据将由此备份替换。恢复前会自动生成一份完整保护性备份。",busy,{fullRestore=null}){
+        busy=true;scope.launch{runCatching{withContext(Dispatchers.IO){InventoryBackup.create(context,database,"恢复数据前保护","ALL","恢复前当前数据");InventoryBackup.scheduleRestore(context,p)}}.onSuccess{(context as? ComponentActivity)?.recreate()}.onFailure{busy=false;fullRestore=null;message="恢复已中止：${it.message}"}}
+    }}
+    companyRestore?.let{(p,c)->RestoreConfirmDialog("仅恢复公司“${c.name}”？","该公司的资料、台账、任务和盘点记录将从备份恢复；其他公司不受影响。同名公司存在时会明确覆盖。操作前会自动完整备份当前数据。",busy,{companyRestore=null}){
+        busy=true;scope.launch{runCatching{withContext(Dispatchers.IO){InventoryBackup.create(context,database,"选择性恢复前保护","COMPANY",c.name);SelectiveRestore.restoreCompany(context,database,p,c.id,true)}}.onSuccess{busy=false;companyRestore=null;message="公司“${c.name}”已恢复";refresh++}.onFailure{busy=false;companyRestore=null;message="恢复失败：${it.message}"}}
+    }}
+    taskRestore?.let{(p,t)->RestoreConfirmDialog("仅恢复任务“${t.name}”？","只恢复该任务及其区域、盘点记录和异常照片；所属公司必须已存在。同一任务存在时会明确覆盖。操作前会自动完整备份当前数据。",busy,{taskRestore=null}){
+        busy=true;scope.launch{runCatching{withContext(Dispatchers.IO){InventoryBackup.create(context,database,"选择性恢复前保护","TASK",t.name);SelectiveRestore.restoreTask(context,database,p,t.id,true)}}.onSuccess{busy=false;taskRestore=null;message="任务“${t.name}”已恢复";refresh++}.onFailure{busy=false;taskRestore=null;message="恢复失败：${it.message}"}}
+    }}
+}
+
+@Composable
+private fun RestoreConfirmDialog(title:String,body:String,busy:Boolean,onDismiss:()->Unit,onConfirm:()->Unit){
+    AlertDialog(onDismissRequest={if(!busy)onDismiss()},title={Text(title)},text={Text(if(busy)"正在先保护当前数据并执行恢复，请勿关闭 App…" else body)},confirmButton={Button(onClick=onConfirm,enabled=!busy,colors=ButtonDefaults.buttonColors(containerColor=MaterialTheme.colorScheme.error)){Text(if(busy)"正在恢复…" else "备份当前数据并恢复")}},dismissButton={TextButton(onClick=onDismiss,enabled=!busy){Text("保留当前数据")}})
+}
+
+@Composable
+private fun BackupDetailLists(preview:BackupPreview,onCompany:(BackupCompany)->Unit={},onTask:(BackupTask)->Unit={}){
+    Spacer(Modifier.height(12.dp));Text("公司明细（可单独恢复）",style=MaterialTheme.typography.titleSmall)
+    preview.companyDetails.forEach{company->ListItem(headlineContent={Text(company.name)},supportingContent={Text(company.code)},trailingContent={TextButton(onClick={onCompany(company)}){Text("仅恢复")}})}
+    Spacer(Modifier.height(8.dp));Text("盘点任务（可单独恢复）",style=MaterialTheme.typography.titleSmall)
+    if(preview.taskDetails.isEmpty())Text("暂无盘点任务") else preview.taskDetails.forEach{task->ListItem(headlineContent={Text(task.name)},supportingContent={Text("${task.companyName} · ${task.status}")},trailingContent={TextButton(onClick={onTask(task)}){Text("仅恢复")}})}
+}
+
+@Composable
+private fun BackupScreenLegacy(database:InventoryDatabase,onBack:()->Unit){
     val context=LocalContext.current;val scope=rememberCoroutineScope();var message by remember{mutableStateOf("备份包含公司、区域、台账、任务、扫描、审计和异常照片")};var preview by remember{mutableStateOf<BackupPreview?>(null)};var confirmRestore by remember{mutableStateOf(false)};var restoring by remember{mutableStateOf(false)};var refresh by remember{mutableIntStateOf(0)};var selectedFile by remember{mutableStateOf<File?>(null)};var selectedPreview by remember{mutableStateOf<BackupPreview?>(null)};var deleteFile by remember{mutableStateOf<File?>(null)};var pendingSave by remember{mutableStateOf<File?>(null)}
     val picker=rememberLauncherForActivityResult(ActivityResultContracts.OpenDocument()){uri:Uri?->if(uri!=null)scope.launch{runCatching{withContext(Dispatchers.IO){InventoryBackup.inspect(context,uri)}}.onSuccess{preview=it;message="备份校验通过"}.onFailure{message="读取失败：${it.message}"}}}
     val saver=rememberLauncherForActivityResult(ActivityResultContracts.CreateDocument("application/octet-stream")){uri:Uri?->val source=pendingSave;if(uri!=null&&source!=null)runCatching{context.contentResolver.openOutputStream(uri)?.use{out->source.inputStream().use{it.copyTo(out)}}?:error("无法写入所选位置")}.onSuccess{message="备份已保存到你选择的位置"}.onFailure{message="保存失败：${it.message}"};pendingSave=null}
@@ -955,11 +1058,11 @@ private fun BackupScreen(database:InventoryDatabase,onBack:()->Unit){
     Page("备份与恢复",onBack){Text(message);Spacer(Modifier.height(14.dp));Button(onClick={runCatching{InventoryBackup.create(context,database)}.onSuccess{file->refresh++;inspect(file);message="保护性备份已生成"}.onFailure{message="备份失败：${it.message}"}},modifier=Modifier.fillMaxWidth()){Text("生成保护性备份")};Spacer(Modifier.height(10.dp));OutlinedButton(onClick={picker.launch(arrayOf("application/octet-stream","application/zip","*/*"))},modifier=Modifier.fillMaxWidth()){Text("从其他位置选择备份")};Spacer(Modifier.height(18.dp));Text("App 内保存的备份（${backups.size}）",style=MaterialTheme.typography.titleMedium);Text("实际目录：${File(context.filesDir,"task_packages").absolutePath}",style=MaterialTheme.typography.bodySmall,color=MaterialTheme.colorScheme.onSurfaceVariant);Text("如需在文件管理器中查找，请使用“另存为”选择下载目录。",style=MaterialTheme.typography.bodySmall,color=MaterialTheme.colorScheme.onSurfaceVariant);Spacer(Modifier.height(8.dp));if(backups.isEmpty())Text("暂无保护性备份") else LazyColumn(Modifier.fillMaxWidth().weight(1f)){items(backups,key={it.absolutePath}){file->ListItem(headlineContent={Text(file.name)},supportingContent={Text("${SimpleDateFormat("yyyy-MM-dd HH:mm:ss",Locale.CHINA).format(Date(file.lastModified()))} · ${"%.1f".format(file.length()/1024.0/1024.0)} MB")},trailingContent={TextButton(onClick={inspect(file)}){Text("预览")}});Row(Modifier.fillMaxWidth().padding(horizontal=8.dp),horizontalArrangement=Arrangement.spacedBy(2.dp)){TextButton(onClick={share(file)}){Text("分享")};TextButton(onClick={pendingSave=file;saver.launch(file.name)}){Text("另存为")};TextButton(onClick={deleteFile=file},colors=ButtonDefaults.textButtonColors(contentColor=MaterialTheme.colorScheme.error)){Text("删除")}};HorizontalDivider()}};selectedFile?.let{file->selectedPreview?.let{p->AlertDialog(onDismissRequest={selectedFile=null;selectedPreview=null},title={Text("备份内容预览")},text={Column(Modifier.heightIn(max=560.dp).verticalScroll(rememberScrollState())){Text(file.name,style=MaterialTheme.typography.titleSmall);Text("生成时间：${SimpleDateFormat("yyyy-MM-dd HH:mm:ss",Locale.CHINA).format(Date(p.createdAt))}");Spacer(Modifier.height(8.dp));Text("公司 ${p.companies} · 任务 ${p.tasks}");Text("台账 ${p.assets} · 扫码 ${p.scans} · 照片 ${p.photos}");BackupDetailLists(p);Spacer(Modifier.height(8.dp));Text("大小：${"%.1f".format(file.length()/1024.0/1024.0)} MB");Text("路径：${file.absolutePath}",style=MaterialTheme.typography.bodySmall)}},confirmButton={Button(onClick={preview=p;selectedFile=null;selectedPreview=null},colors=ButtonDefaults.buttonColors(containerColor=MaterialTheme.colorScheme.error)){Text("准备恢复")}},dismissButton={Row{TextButton(onClick={share(file)}){Text("分享")};TextButton(onClick={selectedFile=null;selectedPreview=null}){Text("关闭")}}})}};preview?.let{p->Spacer(Modifier.height(14.dp));Card(Modifier.fillMaxWidth()){Column(Modifier.padding(16.dp)){Text("待恢复的备份内容",style=MaterialTheme.typography.titleMedium);Text("公司 ${p.companies} · 任务 ${p.tasks}");Text("台账 ${p.assets} · 扫码 ${p.scans} · 照片 ${p.photos}");Text(SimpleDateFormat("yyyy-MM-dd HH:mm:ss",Locale.CHINA).format(Date(p.createdAt)))}};Spacer(Modifier.height(10.dp));Button(onClick={confirmRestore=true},colors=ButtonDefaults.buttonColors(containerColor=MaterialTheme.colorScheme.error),modifier=Modifier.fillMaxWidth()){Text("用此备份替换当前全部数据")}}
     }
     deleteFile?.let{file->AlertDialog(onDismissRequest={deleteFile=null},title={Text("删除这份备份？")},text={Text("将永久删除 ${file.name}。如果尚未另存或分享，删除后将无法用于恢复。")},confirmButton={Button(onClick={if(file.delete()){message="备份已删除";refresh++}else message="备份删除失败";deleteFile=null},colors=ButtonDefaults.buttonColors(containerColor=MaterialTheme.colorScheme.error)){Text("确认删除")}},dismissButton={TextButton(onClick={deleteFile=null}){Text("取消")}})}
-    if(confirmRestore)AlertDialog(onDismissRequest={if(!restoring)confirmRestore=false},title={Text("确认恢复完整备份？")},text={Text(if(restoring)"正在备份恢复前的当前数据，请勿关闭 App…" else "恢复前会先自动生成一份当前数据的保护性备份。只有备份成功后才会替换数据并重启；若备份失败，恢复将自动中止。")},confirmButton={Button(onClick={val target=preview?:return@Button;restoring=true;scope.launch{runCatching{withContext(Dispatchers.IO){val protection=InventoryBackup.create(context,database);InventoryBackup.scheduleRestore(context,target);protection}}.onSuccess{confirmRestore=false;restoring=false;(context as? ComponentActivity)?.recreate()}.onFailure{restoring=false;confirmRestore=false;message="恢复已中止：无法生成恢复前保护性备份（${it.message}）"}}},enabled=!restoring){Text(if(restoring)"正在保护当前数据…" else "备份当前数据并恢复")}},dismissButton={TextButton(onClick={confirmRestore=false},enabled=!restoring){Text("取消")}})
+    if(confirmRestore)AlertDialog(onDismissRequest={if(!restoring)confirmRestore=false},title={Text("确认恢复完整备份？")},text={Text(if(restoring)"正在备份恢复前的当前数据，请勿关闭 App…" else "恢复前会先自动生成一份当前数据的保护性备份。只有备份成功后才会替换数据并重启；若备份失败，恢复将自动中止。")},confirmButton={Button(onClick={val target=preview?:return@Button;restoring=true;scope.launch{runCatching{withContext(Dispatchers.IO){val protection=InventoryBackup.create(context,database,"恢复数据前保护","ALL","恢复前当前数据");InventoryBackup.scheduleRestore(context,target);protection}}.onSuccess{confirmRestore=false;restoring=false;(context as? ComponentActivity)?.recreate()}.onFailure{restoring=false;confirmRestore=false;message="恢复已中止：无法生成恢复前保护性备份（${it.message}）"}}},enabled=!restoring){Text(if(restoring)"正在保护当前数据…" else "备份当前数据并恢复")}},dismissButton={TextButton(onClick={confirmRestore=false},enabled=!restoring){Text("取消")}})
 }
 
 @Composable
-private fun BackupDetailLists(preview:BackupPreview){
+private fun BackupDetailListsLegacy(preview:BackupPreview){
     Spacer(Modifier.height(10.dp));Text("公司明细",style=MaterialTheme.typography.titleSmall)
     preview.companyDetails.forEach{Text("• ${it.name}（${it.code}）")}
     Spacer(Modifier.height(8.dp));Text("盘点任务",style=MaterialTheme.typography.titleSmall)
