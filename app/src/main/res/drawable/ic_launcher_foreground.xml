@@ -1,6 +1,22 @@
 <?xml version="1.0" encoding="utf-8"?>
-<vector xmlns:android="http://schemas.android.com/apk/res/android" android:width="108dp" android:height="108dp" android:viewportWidth="108" android:viewportHeight="108">
-    <path android:fillColor="#FFFFFF" android:fillType="evenOdd" android:pathData="M28,24h22v22h-22zM33,29h12v12h-12zM58,24h22v22h-22zM63,29h12v12h-12zM28,54h22v22h-22zM33,59h12v12h-12z"/>
-    <path android:fillColor="#FFFFFF" android:pathData="M56,53h7v7h-7zM66,53h6v6h-6zM75,52h6v12h-6zM54,63h7v13h-7zM64,63h7v6h-7zM73,68h8v8h-8z"/>
-    <path android:fillColor="#B9F6CA" android:pathData="M49,48h10v10h-10z"/>
+<vector xmlns:android="http://schemas.android.com/apk/res/android"
+    android:width="108dp"
+    android:height="108dp"
+    android:viewportWidth="108"
+    android:viewportHeight="108">
+    <group android:pivotX="54" android:pivotY="54" android:scaleX="0.82" android:scaleY="0.82">
+    <!-- Inventory clipboard: readable inside the adaptive-icon safe zone. -->
+    <path android:fillColor="#FFFFFF" android:pathData="M32,25h44c3.3,0 6,2.7 6,6v48c0,3.3 -2.7,6 -6,6H32c-3.3,0 -6,-2.7 -6,-6V31c0,-3.3 2.7,-6 6,-6z"/>
+    <path android:fillColor="#CFF8E0" android:pathData="M43,21h22c2.2,0 4,1.8 4,4v6H39v-6c0,-2.2 1.8,-4 4,-4z"/>
+
+    <!-- Compact QR finder blocks and data modules. -->
+    <path android:fillColor="#075E54" android:fillType="evenOdd"
+        android:pathData="M34,38h14v14H34zM38,42h6v6h-6zM55,38h14v14H55zM59,42h6v6h-6zM34,58h14v14H34zM38,62h6v6h-6z"/>
+    <path android:fillColor="#075E54"
+        android:pathData="M52,56h5v5h-5zM60,55h5v5h-5zM68,56h5v9h-5zM51,64h5v9h-5zM59,64h6v5h-6z"/>
+
+    <!-- Successful inventory confirmation. -->
+    <path android:fillColor="#35C878" android:pathData="M68,62a14,14 0,1 0,0 28a14,14 0,1 0,0 -28z"/>
+    <path android:fillColor="#FFFFFF" android:pathData="M60.5,75.2l4.5,4.5l10.8,-11l3.2,3.1L65,86l-7.7,-7.7z"/>
+    </group>
 </vector>

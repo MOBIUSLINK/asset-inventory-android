@@ -11,8 +11,8 @@ android {
         applicationId = "cn.assetinventory.app"
         minSdk = 29
         targetSdk = 37
-        versionCode = 124
-        versionName = "1.1.0-beta24"
+        versionCode = 126
+        versionName = "1.1.0-beta26"
     }
 
     buildFeatures { compose = true; buildConfig = true }
